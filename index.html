@@ -1462,7 +1462,7 @@ function rSettings(){
   </div>
   <div class="card rb"><div style="font-size:10px;color:var(--red);text-transform:uppercase;font-weight:700;margin-bottom:10px">DANGER ZONE</div>
   <button class="btn btn-red btn-full" onclick="confirmReset()">🗑️ Reset All Data</button></div>
-  <div style="text-align:center;margin-top:14px;font-size:11px;color:var(--muted)">Best Solution App · Dot Dynasty LLC · v18<br>${_cloudUser?('☁️ Synced — '+(_cloudUser.email||'signed in')):'Saved on this device · sign in above to sync'}</div>
+  <div style="text-align:center;margin-top:14px;font-size:11px;color:var(--muted)">Best Solution App · Dot Dynasty LLC<br>Syncs automatically between devices, no login needed</div>
   <div style="height:10px"></div>`;
 }
 function setSt(k,v){S.settings[k]=v;saveS();toast('Saved!');}
@@ -1561,36 +1561,37 @@ function mClose(){$$('mo').classList.remove('on');document.body.style.overflow='
 function mMaybeClose(e){if(e.target===$$('mo'))mClose();}
 
 // ===================================================
-// CLOUD SYNC (Supabase) - offline-first, localStorage stays primary
+// CLOUD SYNC (Supabase) - no login, shared between devices
 // ===================================================
 const SB_URL='https://ylotwhvkrlobrpdmngul.supabase.co';
 const SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlsb3R3aHZrcmxvYnJwZG1uZ3VsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc1MDY0NDAsImV4cCI6MjA5MzA4MjQ0MH0.k_94GPfSLJpbib4pt3bSV6xTYM1hATninPHWU6iCHjI';
-let sb=null,_cloudUser=null,_cloudTimer=null,_syncState='off';
+const SHARED_ID='shared';
+let sb=null,_cloudTimer=null,_syncState='off';
 try{ if(window.supabase)sb=window.supabase.createClient(SB_URL,SB_KEY); }catch(e){console.warn('Supabase init failed',e);}
 
-function syncLabel(st){return {off:'Not signed in',syncing:'Syncing…',synced:'Synced ✓',error:'Sync error — working offline'}[st]||'';}
+function syncLabel(st){return {off:'Connecting…',syncing:'Syncing…',synced:'Synced ✓',error:'Offline — will sync later'}[st]||'';}
 function setSync(st){_syncState=st;const el=$$('cl_status');if(el)el.textContent=syncLabel(st);}
 
 async function cloudPull(){
-  if(!sb||!_cloudUser)return null;
+  if(!sb)return null;
   try{
-    const{data,error}=await sb.from('app_data').select('data_value').eq('data_key','bs_blank_state').maybeSingle();
+    const{data,error}=await sb.from('blank_app_state').select('data').eq('id',SHARED_ID).maybeSingle();
     if(error||!data)return null;
-    return data.data_value;
+    return data.data;
   }catch(e){console.warn('cloudPull',e);return null;}
 }
 async function cloudPush(){
-  if(!sb||!_cloudUser)return;
+  if(!sb)return;
   if(!S._updatedAt)S._updatedAt=new Date().toISOString();
   setSync('syncing');
   try{
-    const{error}=await sb.from('app_data').upsert({user_id:_cloudUser.id,data_key:'bs_blank_state',data_value:S,updated_at:new Date().toISOString()},{onConflict:'user_id,data_key'});
+    const{error}=await sb.from('blank_app_state').upsert({id:SHARED_ID,data:S,updated_at:new Date().toISOString()},{onConflict:'id'});
     setSync(error?'error':'synced');
     if(error)console.warn('cloudPush',error);
   }catch(e){console.warn('cloudPush',e);setSync('error');}
 }
 function cloudQueuePush(){
-  if(!sb||!_cloudUser)return;
+  if(!sb)return;
   clearTimeout(_cloudTimer);
   setSync('syncing');
   _cloudTimer=setTimeout(cloudPush,800);
@@ -1630,65 +1631,19 @@ async function cloudHydrate(){
 }
 async function cloudInit(){
   if(!sb)return;
-  try{
-    const{data:{session}}=await sb.auth.getSession();
-    if(session&&session.user){_cloudUser=session.user;setSync('syncing');await cloudHydrate();}
-  }catch(e){console.warn('cloudInit',e);}
-}
-async function cloudSignIn(){
-  if(!sb){toast('Cloud sync unavailable - no connection');return;}
-  const email=($$('cl_email').value||'').trim();
-  const pass=$$('cl_pass').value||'';
-  if(!email||!pass){toast('Enter email and password');return;}
-  const btn=$$('cl_btn');if(btn){btn.disabled=true;btn.textContent='SIGNING IN…';}
-  try{
-    const{data,error}=await sb.auth.signInWithPassword({email,password:pass});
-    if(error){toast(error.message||'Sign in failed');if(btn){btn.disabled=false;btn.textContent='SIGN IN';}return;}
-    _cloudUser=data.user;
-    toast('✅ Signed in');
-    setSync('syncing');
-    await cloudHydrate();
-    rSettings();
-    toast('✅ Cloud sync on');
-  }catch(e){toast('Sign in failed');if(btn){btn.disabled=false;btn.textContent='SIGN IN';}}
-}
-async function cloudSignUp(){
-  if(!sb){toast('Cloud sync unavailable - no connection');return;}
-  const email=($$('cl_email').value||'').trim();
-  const pass=$$('cl_pass').value||'';
-  if(!email||!pass){toast('Enter email and password');return;}
-  if(pass.length<6){toast('Password must be at least 6 characters');return;}
-  try{
-    const{data,error}=await sb.auth.signUp({email,password:pass});
-    if(error){toast(error.message||'Sign up failed');return;}
-    if(data&&data.session&&data.user){
-      _cloudUser=data.user;
-      toast('Account created');
-      setSync('syncing');
-      await cloudHydrate();
-      rSettings();
-    }else{
-      toast('Account created. Check your email to confirm, then Sign In.');
-    }
-  }catch(e){toast('Sign up failed');}
-}
-async function cloudSignOut(){
-  try{if(sb)await sb.auth.signOut();}catch(e){}
-  _cloudUser=null;setSync('off');rSettings();
-  toast('Signed out - app still works offline');
+  setSync('syncing');
+  await cloudHydrate();
 }
 async function cloudSyncNow(){
-  if(!_cloudUser){toast('Sign in first');return;}
-  setSync('syncing');await cloudPush();rSettings();
+  if(!sb){toast('Sync unavailable - no connection');return;}
+  setSync('syncing');
+  await cloudHydrate();
+  rSettings();
+  toast('Synced');
 }
 function cloudCardHTML(){
-  if(_cloudUser){
-    const email=_cloudUser.email||'signed in';
-    return `<div class="card grb"><div style="font-size:10px;color:var(--green);text-transform:uppercase;font-weight:700;margin-bottom:8px">☁️ CLOUD SYNC</div><div style="font-size:13px;margin-bottom:4px">Signed in as <strong>${email}</strong></div><div id="cl_status" style="font-size:12px;color:var(--muted);margin-bottom:10px">${syncLabel(_syncState)||'Synced ✓'}</div><div class="g2" style="gap:8px"><button class="btn btn-ghost btn-full" onclick="cloudSyncNow()">🔄 Sync Now</button><button class="btn btn-ghost btn-full" onclick="cloudSignOut()">Sign Out</button></div></div>`;
-  }
-  return `<div class="card bb"><div style="font-size:10px;color:var(--blue);text-transform:uppercase;font-weight:700;margin-bottom:8px">☁️ CLOUD SYNC</div><div style="font-size:12px;color:var(--muted);margin-bottom:10px">Sign in to back up your data and sync across all your devices. The app still works offline either way.</div><div class="fg"><label class="fl">EMAIL</label><input class="fi" id="cl_email" type="email" placeholder="you@email.com" autocomplete="username"></div><div class="fg"><label class="fl">PASSWORD</label><input class="fi" id="cl_pass" type="password" placeholder="••••••••" autocomplete="current-password"></div><button class="btn btn-gold btn-full" id="cl_btn" onclick="cloudSignIn()">SIGN IN</button><button class="btn btn-ghost btn-full" style="margin-top:8px" onclick="cloudSignUp()">CREATE ACCOUNT</button><div id="cl_status" style="font-size:11px;color:var(--muted);text-align:center;margin-top:8px"></div></div>`;
+  return `<div class="card grb"><div style="font-size:10px;color:var(--green);text-transform:uppercase;font-weight:700;margin-bottom:8px">CLOUD SYNC</div><div style="font-size:12px;color:var(--muted);margin-bottom:10px">Syncs automatically between all devices. No login needed. Anything entered on one phone shows up on the other within seconds.</div><div id="cl_status" style="font-size:12px;color:var(--muted);margin-bottom:10px">${syncLabel(_syncState)||'Synced ✓'}</div><button class="btn btn-ghost btn-full" onclick="cloudSyncNow()">Sync Now</button></div>`;
 }
-
 
 // ===================================================
 // INIT
