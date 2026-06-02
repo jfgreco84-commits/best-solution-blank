@@ -218,7 +218,7 @@
 <div id="hdr">
   <div class="hdr-brand">
     <span class="hdr-logo">⚡</span>
-    <div><div class="hdr-name">Best Solution</div><div class="hdr-sub">Dot Dynasty LLC</div></div>
+    <div><div class="hdr-name">Best Solution</div><div class="hdr-sub">Batnizzle's Purple Drizzle Fo-Shizzle!</div></div>
   </div>
   <div id="hdrR"></div>
 </div>
@@ -231,6 +231,7 @@
   <div id="pg-show" class="pg"></div>
   <div id="pg-calendar" class="pg"></div>
   <div id="pg-supplies" class="pg"></div>
+  <div id="pg-pnl" class="pg"></div>
   <div id="pg-settings" class="pg"></div>
 </div>
 
@@ -241,6 +242,7 @@
   <button class="nb" id="nb-shows" onclick="go('shows')"><span class="ni">🎪</span>SHOWS</button>
   <button class="nb" id="nb-calendar" onclick="go('calendar')"><span class="ni">📅</span>CAL</button>
   <button class="nb" id="nb-supplies" onclick="go('supplies')"><span class="ni">🧴</span>SUPPLY</button>
+  <button class="nb" id="nb-pnl" onclick="go('pnl')"><span class="ni">💰</span>P&amp;L</button>
   <button class="nb" id="nb-settings" onclick="go('settings')"><span class="ni">⚙️</span>SETUP</button>
 </div>
 
@@ -348,6 +350,11 @@ function loadS(){
 function applyOneTimeUpdates(d){
   // Blank template app: no seeded shows, inventory, or debt.
   d._applied=d._applied||{};
+  // Seed showExpenses array on all shows that don't have it
+  if(!d._applied['show_expenses_seed_v1']){
+    (d.shows||[]).forEach(sh=>{if(!sh.showExpenses)sh.showExpenses=[];});
+    d._applied['show_expenses_seed_v1']=true;
+  }
 }
 
 function buildPlannedShow(e){
@@ -363,7 +370,7 @@ function buildPlannedShow(e){
     id:'sh_auto_'+e.name.replace(/[^a-z0-9]/gi,'').toLowerCase().substring(0,20)+'_'+Date.now()+Math.floor(Math.random()*1000),
     name:e.name,location:e.location||'',numDays:e.numDays,dates,startDate:e.startDate,
     boothCost:e.boothCost||0,boothPayments:e.boothPayments||[],miles:e.miles||0,
-    status:'planned',confirmed:true,
+    status:'planned',confirmed:true,showExpenses:[],
     days,packedInventory:null,createdAt:new Date().toISOString()
   };
 }
@@ -374,6 +381,7 @@ function renderCur(){
   else if(curPg==='shows')rShows();else if(curPg==='show')rShow();
   else if(curPg==='calendar')rCalendar();
   else if(curPg==='supplies')rSupplies();
+  else if(curPg==='pnl')rPnL();
   else if(curPg==='settings')rSettings();
   updateSupplyBadge();
 }
@@ -411,6 +419,8 @@ function calcShow(sh){
     if(d.morningCount&&d.eveningCount){const sold=calcSold(d.morningCount,d.eveningCount);gross+=calcRev(sold);cogs+=calcCOGS(sold);}
     if(d.expenses)exp+=Object.values(d.expenses).reduce((a,b)=>a+(parseFloat(b)||0),0);
   });
+  exp+=(sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
+  exp+=(sh.lodging||0);
   const profit=gross-cogs-exp;
   return{gross,cogs,expenses:exp,profit,taxRes:Math.max(0,profit*S.settings.tax)};
 }
@@ -428,8 +438,12 @@ function calcYTD(){
       if(d.payments)PMTS.forEach(p=>pmtTotals[p.key]+=(parseFloat(d.payments[p.key])||0));
     });
   });
-  // Non-completed shows: booth payments already made count as real money out
-  S.shows.filter(s=>s.status!=='completed').forEach(sh=>{expenses+=boothPaid(sh);});
+  // Non-completed shows: booth payments + any logged show expenses count as real money out
+  S.shows.filter(s=>s.status!=='completed').forEach(sh=>{
+    expenses+=boothPaid(sh);
+    expenses+=(sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
+    expenses+=(sh.lodging||0);
+  });
   // Other expenses: supplies, equipment, misc — logged separately
   const otherSpend=(S.otherExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
   expenses+=otherSpend;
@@ -881,8 +895,20 @@ function calcBreakEven(sh){
   const mpg=S.settings.mpg||17.5;
   const gp=S.settings.gasPrice||3.50;
   const gas=(sh.miles||0)*2*(sh.numDays||1)/mpg*gp;
-  return (sh.boothCost||0)+gas+(sh.lodging||0);
+  const showExp=(sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
+  return (sh.boothCost||0)+gas+(sh.lodging||0)+showExp;
 }
+const SHOW_EXP_CATS=[
+  {key:'fuel',   label:'Fuel',         icon:'⛽'},
+  {key:'hotel',  label:'Hotel/Lodging', icon:'🏨'},
+  {key:'flight', label:'Flight',        icon:'✈️'},
+  {key:'car',    label:'Car Rental',    icon:'🚗'},
+  {key:'supply', label:'Supplies',      icon:'🧴'},
+  {key:'food',   label:'Food & Meals',  icon:'🍔'},
+  {key:'park',   label:'Parking',       icon:'🅿️'},
+  {key:'tax',    label:'Sales Tax',     icon:'🧾'},
+  {key:'other',  label:'Other',         icon:'💸'},
+];
 function showCard(sh){
   const t=calcShow(sh);
   const cls=sh.status==='active'?'sa':sh.status==='completed'?'sd':'';
@@ -921,8 +947,9 @@ function showCard(sh){
       <span style="color:var(--muted)">Break Even: <b style="color:var(--gold)">${fmt(be)}</b></span>
       <span style="color:${beHit?'var(--green)':'var(--red)'};font-weight:700">${beHit?'✅ HIT — '+fmt(t.gross-be)+' over':'❌ MISSED by '+fmt(be-t.gross)}</span>
     </div>`:``}
-    <div style="margin-top:8px;text-align:center" onclick="event.stopPropagation()">
-      <button style="font-size:11px;padding:5px 14px;background:rgba(100,149,237,0.12);border:1px solid rgba(100,149,237,0.3);color:#7EB8F7;border-radius:6px;cursor:pointer;font-weight:700" onclick="showLodgingModal('${sh.id}')">${sh.lodging?'🏨 Lodging: '+fmt(sh.lodging):'🏨 Lodging Expenses'}</button>
+    <div style="margin-top:8px;display:flex;gap:6px" onclick="event.stopPropagation()">
+      <button style="flex:1;font-size:11px;padding:5px 8px;background:rgba(100,149,237,0.12);border:1px solid rgba(100,149,237,0.3);color:#7EB8F7;border-radius:6px;cursor:pointer;font-weight:700" onclick="showLodgingModal('${sh.id}')">${sh.lodging?'🏨 '+fmt(sh.lodging):'🏨 Lodging'}</button>
+      <button style="flex:1;font-size:11px;padding:5px 8px;background:${(sh.showExpenses||[]).length?'rgba(255,165,0,0.15)':'rgba(255,165,0,0.07)'};border:1px solid rgba(255,165,0,0.3);color:#FFA500;border-radius:6px;cursor:pointer;font-weight:700" onclick="showShowExpModal('${sh.id}')">${(sh.showExpenses||[]).length?'💸 Exp: '+fmt((sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0)):'💸 Other Expenses'}</button>
     </div>
   </div>`;
 }
@@ -939,6 +966,157 @@ function saveLodging(id){
   sh.lodging=parseFloat($$('lod_amt').value)||0;
   saveS();mClose();toast('Lodging saved!');rShows();
 }
+
+// ===================================================
+// SHOW OTHER EXPENSES
+// ===================================================
+function showShowExpModal(id){
+  const sh=S.shows.find(s=>s.id===id);if(!sh)return;
+  if(!sh.showExpenses)sh.showExpenses=[];
+  const total=sh.showExpenses.reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
+  const listHtml=sh.showExpenses.length?sh.showExpenses.map((e,i)=>{
+    const cat=SHOW_EXP_CATS.find(c=>c.key===e.cat)||{icon:'💸',label:'Other'};
+    return`<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border)">
+      <span style="font-size:18px">${cat.icon}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:700">${cat.label}${e.desc?' — '+e.desc:''}</div>
+        <div style="font-size:11px;color:var(--muted)">${e.date||''}</div>
+      </div>
+      <div style="font-size:15px;font-weight:900;color:var(--red);margin-right:6px">-${fmt(e.amount)}</div>
+      <button style="background:var(--redbg);border:1px solid var(--redbd);color:var(--red);border-radius:6px;padding:4px 8px;cursor:pointer;font-size:11px;font-weight:700" onclick="delShowExp('${id}',${i})">✕</button>
+    </div>`;
+  }).join(''):`<div style="font-size:12px;color:var(--muted);padding:10px 0">No expenses logged yet.</div>`;
+  const today=new Date().toISOString().split('T')[0];
+  mOpen(`<div class="mh"><div class="mt">💸 Other Expenses</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:4px">${sh.name}</div>
+  ${total>0?`<div style="font-size:14px;font-weight:900;color:var(--red);margin-bottom:12px">Total: -${fmt(total)}</div>`:''}
+  ${listHtml}
+  <div style="margin-top:14px;padding-top:12px;border-top:2px solid var(--border)">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:700;margin-bottom:10px">ADD EXPENSE</div>
+    <div class="fg"><label class="fl">Category</label>
+      <select class="fi" id="se_cat">
+        ${SHOW_EXP_CATS.map(c=>`<option value="${c.key}">${c.icon} ${c.label}</option>`).join('')}
+      </select>
+    </div>
+    <div class="g2" style="gap:10px">
+      <div class="fg"><label class="fl">Amount ($)</label><input class="fi" type="number" id="se_amt" placeholder="0.00" step="0.01" min="0" inputmode="decimal"></div>
+      <div class="fg"><label class="fl">Date</label><input class="fi" type="date" id="se_date" value="${today}"></div>
+    </div>
+    <div class="fg"><label class="fl">Description (optional)</label><input class="fi" type="text" id="se_desc" placeholder="e.g. Round trip gas, Airbnb, supplies run"></div>
+    <button class="btn btn-gold btn-full" onclick="addShowExp('${id}')">Add Expense</button>
+  </div>`);
+}
+function addShowExp(id){
+  const sh=S.shows.find(s=>s.id===id);if(!sh)return;
+  const amt=parseFloat($$('se_amt').value);
+  if(!amt||amt<=0){toast('Enter a valid amount');return;}
+  if(!sh.showExpenses)sh.showExpenses=[];
+  sh.showExpenses.push({
+    id:'se_'+Date.now(),
+    cat:$$('se_cat').value,
+    amount:amt,
+    desc:($$('se_desc').value||'').trim(),
+    date:$$('se_date').value||new Date().toISOString().split('T')[0]
+  });
+  saveS();toast('Expense added!');showShowExpModal(id);
+}
+function delShowExp(id,idx){
+  const sh=S.shows.find(s=>s.id===id);if(!sh||!sh.showExpenses)return;
+  if(!confirm('Delete this expense?'))return;
+  sh.showExpenses.splice(idx,1);
+  saveS();toast('Expense removed');showShowExpModal(id);
+}
+
+// ===================================================
+// P&L TAB
+// ===================================================
+function rPnL(){
+  const y=new Date().getFullYear();
+  const ytd=calcYTD();
+  const tax=S.settings.tax||0.28;
+  const taxAmt=Math.max(0,ytd.profit*tax);
+  const keep=Math.max(0,ytd.profit-taxAmt);
+  const qtr=taxAmt/4;
+  let boothTotal=0,showExpTotal=0,dayExpTotal=0,lodgingTotal=0;
+  S.shows.forEach(sh=>{
+    if(sh.status==='completed'){
+      boothTotal+=sh.boothCost||0;
+      showExpTotal+=(sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
+      lodgingTotal+=sh.lodging||0;
+      (sh.days||[]).forEach(d=>{if(d.expenses)dayExpTotal+=Object.values(d.expenses).reduce((a,b)=>a+(parseFloat(b)||0),0);});
+    } else {
+      boothTotal+=boothPaid(sh);
+      showExpTotal+=(sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
+      lodgingTotal+=sh.lodging||0;
+    }
+  });
+  const globalSupply=ytd.otherSpend||0;
+  const done=S.shows.filter(s=>s.status==='completed').sort((a,b)=>showSortKey(a)<showSortKey(b)?-1:1);
+  const catTotals={};
+  S.shows.forEach(sh=>{(sh.showExpenses||[]).forEach(e=>{catTotals[e.cat]=(catTotals[e.cat]||0)+(parseFloat(e.amount)||0);});});
+  const margin=ytd.gross>0?Math.round((ytd.profit/ytd.gross)*100):0;
+  let h=`<div class="sec-title" style="margin-bottom:12px">💰 P&amp;L — ${y}</div>`;
+  h+=`<div class="card gb" style="margin-bottom:12px">
+    <div class="g2" style="gap:8px;margin-bottom:10px">
+      <div class="sbox gb"><div class="sl">Gross Revenue</div><div class="sv">${fmt(ytd.gross)}</div></div>
+      <div class="sbox ${ytd.profit>=0?'grb':'rb'}"><div class="sl">Net Profit</div><div class="sv ${ytd.profit>=0?'g':'r'}">${fmt(ytd.profit)}</div></div>
+      <div class="sbox rb"><div class="sl">Total Expenses</div><div class="sv r sm">${fmt(ytd.expenses)}</div></div>
+      <div class="sbox"><div class="sl">Profit Margin</div><div class="sv w sm">${margin}%</div></div>
+    </div>
+    <div class="sr"><span class="srl">Product COGS</span><span class="srv red">-${fmt(ytd.cogs)}</span></div>
+    <div class="sr"><span class="srl">Booth / Vendor Fees</span><span class="srv red">-${fmt(boothTotal)}</span></div>
+    <div class="sr"><span class="srl">Show Expenses (fuel, hotel, etc.)</span><span class="srv red">-${fmt(showExpTotal+lodgingTotal+dayExpTotal)}</span></div>
+    <div class="sr" style="border-bottom:none"><span class="srl">Supply Purchases</span><span class="srv red">-${fmt(globalSupply)}</span></div>
+  </div>`;
+  h+=`<div class="card rb" style="margin-bottom:12px">
+    <div style="font-size:10px;color:var(--red);text-transform:uppercase;font-weight:700;margin-bottom:10px">🧾 TAX RESERVE (${Math.round(tax*100)}%)</div>
+    <div class="g2" style="gap:8px;margin-bottom:10px">
+      <div class="sbox rb"><div class="sl">Set Aside Now</div><div class="sv r">${fmt(taxAmt)}</div></div>
+      <div class="sbox grb"><div class="sl">Keep (${100-Math.round(tax*100)}%)</div><div class="sv g">${fmt(keep)}</div></div>
+    </div>
+    <div class="sr"><span class="srl">Est. Quarterly Payment</span><span class="srv red">${fmt(qtr)}</span></div>
+    <div class="sr"><span class="srl">Q1 Due (Apr 15)</span><span class="srv">${fmt(qtr)}</span></div>
+    <div class="sr"><span class="srl">Q2 Due (Jun 15)</span><span class="srv">${fmt(qtr)}</span></div>
+    <div class="sr"><span class="srl">Q3 Due (Sep 15)</span><span class="srv">${fmt(qtr)}</span></div>
+    <div class="sr" style="border-bottom:none"><span class="srl">Q4 Due (Jan 15 next yr)</span><span class="srv">${fmt(qtr)}</span></div>
+    <div style="font-size:10px;color:var(--muted);margin-top:8px">Estimates based on even splits. Change tax % in Setup.</div>
+  </div>`;
+  const catKeys=Object.keys(catTotals);
+  if(catKeys.length>0){
+    h+=`<div class="sec-lbl">SHOW EXPENSE BREAKDOWN</div><div class="card" style="margin-bottom:12px">`;
+    catKeys.sort((a,b)=>catTotals[b]-catTotals[a]).forEach(k=>{const cat=SHOW_EXP_CATS.find(c=>c.key===k)||{icon:'💸',label:'Other'};h+=`<div class="sr"><span class="srl">${cat.icon} ${cat.label}</span><span class="srv red">-${fmt(catTotals[k])}</span></div>`;});
+    h+=`<div class="sr" style="border-bottom:none"><span class="srl b">Total Show Expenses</span><span class="srv red lg">-${fmt(Object.values(catTotals).reduce((a,b)=>a+b,0))}</span></div></div>`;
+  }
+  if(done.length>0){
+    h+=`<div class="sec-lbl">COMPLETED SHOWS — P&amp;L</div>`;
+    done.forEach(sh=>{
+      const t=calcShow(sh);
+      const netColor=t.profit>=0?'var(--green)':'var(--red)';
+      const netSign=t.profit>=0?'+':'';
+      h+=`<div class="card" style="cursor:pointer;padding:10px 14px;margin-bottom:7px" onclick="go('show','${sh.id}',0)">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="flex:1;min-width:0">
+            <div style="font-weight:800;font-size:14px">${sh.name}</div>
+            <div style="font-size:10px;color:var(--muted);margin-top:2px">${sh.dates?sh.dates[0]:''}${sh.dates&&sh.dates.length>1?' – '+sh.dates[sh.dates.length-1]:''} · ${sh.numDays} day${sh.numDays>1?'s':''}</div>
+            <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px">
+              <span class="chip" style="font-size:9px">${fmt(t.gross)} gross</span>
+              <span class="chip" style="font-size:9px;background:var(--redbg);color:var(--red);border-color:var(--redbd)">${fmt(t.expenses)} exp</span>
+            </div>
+          </div>
+          <div style="text-align:right;margin-left:12px;flex-shrink:0">
+            <div style="font-size:18px;font-weight:900;color:${netColor}">${netSign}${fmt(t.profit)}</div>
+            <div style="font-size:9px;color:var(--muted)">${t.gross>0?Math.round((t.profit/t.gross)*100):0}% margin</div>
+          </div>
+        </div>
+      </div>`;
+    });
+  } else {
+    h+=`<div class="empty"><div class="ei">📊</div><div>Complete some shows to see P&amp;L here.</div></div>`;
+  }
+  h+=`<div style="height:10px"></div>`;
+  pg('pnl').innerHTML=h;
+}
+
 function showNewShowModal(){
   const today=new Date().toISOString().split('T')[0];
   mOpen(`<div class="mh"><div class="mt">🎪 New Show</div><button class="mx" onclick="mClose()">×</button></div>
@@ -956,7 +1134,7 @@ function createShow(){
   if(ds){const s=new Date(ds+'T12:00:00');for(let i=0;i<nd;i++){const d=new Date(s);d.setDate(d.getDate()+i);dates.push(d.toLocaleDateString('en-US',{month:'short',day:'numeric'}));}}
   const days=[];
   for(let i=0;i<nd;i++)days.push({dayNum:i+1,date:dates[i]||'Day '+(i+1),morningCount:null,eveningCount:null,payments:{cash:0,square:0,venmo:0,paypal:0,cashapp:0,zelle:0},expenses:{gas:0,food:0,parking:0,hotel:0,other:0},notes:'',status:'open'});
-  const sh={id:'sh_'+Date.now(),name,location:$$('ns_l').value.trim(),numDays:nd,startDate:ds||'',dates,boothCost:bc,miles:mi,status:'planned',days,packedInventory:null,createdAt:new Date().toISOString()};
+  const sh={id:'sh_'+Date.now(),name,location:$$('ns_l').value.trim(),numDays:nd,startDate:ds||'',dates,boothCost:bc,miles:mi,status:'planned',showExpenses:[],days,packedInventory:null,createdAt:new Date().toISOString()};
   S.shows.push(sh);mClose();saveS();toast('Show created!');go('show',sh.id,0);
 }
 
@@ -993,6 +1171,15 @@ function rShow(){
     <div class="sr"><span class="srl">Total Miles (${sh.numDays} days)</span><span class="srv">${(sh.miles||0)*2*sh.numDays} mi</span></div>
     <div class="sr"><span class="srl">IRS Mileage Deduction</span><span class="srv green">${fmt((sh.miles||0)*2*sh.numDays*S.settings.irsRate)}</span></div>
     <div class="sr"><span class="srl">Est. Gas Cost</span><span class="srv">${fmt(((sh.miles||0)*2*sh.numDays/S.settings.mpg)*S.settings.gasPrice)}</span></div>
+  </div>
+  <div class="card" style="margin-top:10px;border-color:rgba(255,165,0,0.3)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div style="font-size:10px;color:#FFA500;text-transform:uppercase;font-weight:700">💸 OTHER EXPENSES</div>
+      <button class="btn btn-xs" style="background:rgba(255,165,0,0.15);border:1px solid rgba(255,165,0,0.4);color:#FFA500" onclick="showShowExpModal('${sh.id}')">+ Add</button>
+    </div>
+    ${(sh.showExpenses||[]).length===0?`<div style="font-size:12px;color:var(--muted)">No expenses logged yet. Tap + Add to log fuel, hotel, flights, supplies, etc.</div>`:`
+    ${(sh.showExpenses||[]).map(e=>{const cat=SHOW_EXP_CATS.find(c=>c.key===e.cat)||{icon:'💸',label:'Other'};return`<div class="sr"><span class="srl">${cat.icon} ${cat.label}${e.desc?' — '+e.desc:''}</span><span class="srv red">-${fmt(e.amount)}</span></div>`;}).join('')}
+    <div class="sr" style="border-top:1px solid rgba(255,165,0,0.2);margin-top:4px"><span class="srl b">Total Other Expenses</span><span class="srv red lg">-${fmt((sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0))}</span></div>`}
   </div>
   <div style="height:10px"></div>`;
 }
