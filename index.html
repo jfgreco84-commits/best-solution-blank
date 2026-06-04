@@ -212,7 +212,7 @@
 
     ::-webkit-scrollbar{width:0;height:0}
   </style>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4"></script>
 </head>
 <body>
 
@@ -818,7 +818,7 @@ function rHome(){
   </div>
   <button class="btn btn-ghost btn-full" style="margin-bottom:14px" onclick="exportCalICS()">📅 Export Shows to Calendar</button>
   ${active?`<button class="btn btn-gold btn-full" style="margin-bottom:14px" onclick="go('show','${active.id}')">🔴 Open Active Show: ${active.name}</button>`:''}
-  <div style="text-align:center;font-size:11px;color:var(--muted);padding-bottom:4px">Best Solution App · Dot Dynasty LLC · v6.1</div>
+  <div style="text-align:center;font-size:11px;color:var(--muted);padding-bottom:4px">Best Solution App · Dot Dynasty LLC · v7.0 (Blank)</div>
   `;
 
   pg('home').innerHTML=html;
@@ -1136,7 +1136,7 @@ function createShow(){
   if(ds){const s=new Date(ds+'T12:00:00');for(let i=0;i<nd;i++){const d=new Date(s);d.setDate(d.getDate()+i);dates.push(d.toLocaleDateString('en-US',{month:'short',day:'numeric'}));}}
   const days=[];
   for(let i=0;i<nd;i++)days.push({dayNum:i+1,date:dates[i]||'Day '+(i+1),morningCount:null,eveningCount:null,payments:{cash:0,square:0,venmo:0,paypal:0,cashapp:0,zelle:0},expenses:{gas:0,food:0,parking:0,hotel:0,other:0},notes:'',status:'open'});
-  const sh={id:'sh_'+Date.now(),name,location:$$('ns_l').value.trim(),numDays:nd,startDate:ds||'',dates,boothCost:bc,miles:mi,status:'planned',showExpenses:[],days,packedInventory:null,createdAt:new Date().toISOString()};
+  const sh={id:'sh_'+Date.now(),name,location:$$('ns_l').value.trim(),numDays:nd,startDate:ds||'',dates,boothCost:bc,miles:mi,status:'planned',showExpenses:[],days,boothPayments:[],confirmed:true,packedInventory:null,createdAt:new Date().toISOString()};
   S.shows.push(sh);mClose();saveS();toast('Show created!');go('show',sh.id,0);
 }
 
@@ -1708,7 +1708,7 @@ function applyClaudeCmd(){
     toast('Unknown command. Start with INV:, ADD:, or SOLD:');
   }catch(e){toast('Command error: '+e.message);}
 }
-function confirmReset(){if(confirm('RESET ALL DATA? Cannot be undone.')){localStorage.removeItem('dd_bs_blank_v6');S=JSON.parse(JSON.stringify(INIT));saveS();toast('Reset!');go('home');}}
+function confirmReset(){if(confirm('RESET ALL DATA? Cannot be undone.')){localStorage.removeItem('dd_bs_blank_v6');localStorage.removeItem('dd_bs_blank_v7');S=JSON.parse(JSON.stringify(INIT));saveS();toast('Reset!');go('home');}}
 function exportData(){
   try{
     const txt=JSON.stringify(S,null,2);
@@ -1737,7 +1737,7 @@ function applyImport(){
     const parsed=JSON.parse(txt);
     if(!parsed.inventory||!parsed.shows){toast('Invalid data. Make sure you copied the full export.');return;}
     parsed.v=INIT.v;S=parsed;
-    localStorage.setItem('dd_bs_blank_v6',JSON.stringify(S));
+    localStorage.setItem('dd_bs_blank_v7',JSON.stringify(S));
     mClose();renderCur();toast('✅ Data imported successfully!');go('home');
   }catch(e){toast('Import failed. Invalid format.');}
 }
