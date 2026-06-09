@@ -190,6 +190,7 @@
     .cal-cell.confirmed{background:rgba(0,210,106,0.18);border-color:var(--green)}
     .cal-cell.possible{background:rgba(255,215,0,0.16);border-color:var(--gold)}
     .cal-cell.completed{background:rgba(0,210,106,0.30);border-color:var(--green)}
+    .cal-cell.conflict{border-color:var(--red)!important;box-shadow:inset 0 0 0 2px rgba(255,60,60,0.75)}
     .cal-num{font-size:11px;font-weight:800;color:var(--text)}
     .cal-cell.today .cal-num{color:var(--gold)}
     .cal-cell.confirmed .cal-num,.cal-cell.completed .cal-num{color:var(--green)}
@@ -272,6 +273,11 @@ const PMTS=[
   {key:'cashapp',label:'Cash App',icon:'💚',color:'#00D632'},
   {key:'zelle',  label:'Zelle',   icon:'🟣',color:'#6D1ED4'}
 ];
+// Commission rates — physical CASH = 35%; card + ALL electronic (Square/Venmo/CashApp/PayPal/Zelle) = 30%
+const COMM_CARD = 0.30;
+const COMM_CASH = 0.35;
+const CASH_COMM_KEYS = ['cash'];
+function commRateForKey(key){ return CASH_COMM_KEYS.includes(key) ? COMM_CASH : COMM_CARD; }
 const PREV_YEAR={gross:0,cogs:0,booth:0,otherExp:0,net:0,shows:0,bestShow:'',bestProfit:0};
 const DEFAULT_SUPPLIES=[
   {id:'sup_bags_lg',   name:'Bags (Large)',      qty:0,low:5, unit:'pk'},
@@ -305,7 +311,7 @@ const INIT={
 // ===================================================
 // STATE
 // ===================================================
-let S,curPg='home',curShow=null,curDay=0,calMonth=null;
+let S,curPg='home',curShow=null,curDay=0,calMonth=null,showsTab='upcoming';
 
 function normalizeShowDates(d){
   // Always fix startDate from dates[] on every load — no flags, always reliable
@@ -350,10 +356,26 @@ function loadS(){
 function applyOneTimeUpdates(d){
   // Blank template app: no seeded shows, inventory, or debt.
   d._applied=d._applied||{};
+  // One-time DEFENSIVE snapshot before the v8 feature pass. Only ADDS a backup key; never clears live state.
+  if(!d._applied['prechange_backup_v8']){
+    try{ localStorage.setItem('dd_bs_blank_prechange_v8_'+Date.now(), JSON.stringify(d)); }catch(e){}
+    d._applied['prechange_backup_v8']=true;
+  }
   // Seed showExpenses array on all shows that don't have it
   if(!d._applied['show_expenses_seed_v1']){
     (d.shows||[]).forEach(sh=>{if(!sh.showExpenses)sh.showExpenses=[];});
     d._applied['show_expenses_seed_v1']=true;
+  }
+  // Reps system (v8): start with a single "owner" rep; user adds their team in Settings → Team.
+  if(!d._applied['reps_seed_v1']){
+    if(!d.reps)d.reps=[];
+    if(!d.reps.length)d.reps.push({id:'rep_owner',name:'Me (Owner)',isSelf:true,active:true,payments:[]});
+    d._applied['reps_seed_v1']=true;
+  }
+  // Ensure rep fields on shows/days
+  if(!d._applied['show_rep_fields_v1']){
+    (d.shows||[]).forEach(sh=>{ if(!sh.repIds)sh.repIds=[]; if(sh.repOnlyShow===undefined)sh.repOnlyShow=false; (sh.days||[]).forEach(day=>{ if(!day.repSales)day.repSales=[]; }); });
+    d._applied['show_rep_fields_v1']=true;
   }
 }
 
@@ -421,18 +443,75 @@ function calcShow(sh){
   });
   exp+=(sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
   exp+=(sh.lodging||0);
+  const supplyCost=(typeof showSupplyCost==='function')?showSupplyCost(sh):0; // auto bags + manual (0 until costs entered)
+  exp+=supplyCost;
+  const commissions=calcShowComm(sh); // honors per-show payout overrides; 0 when no reps
+  exp+=commissions;
   const profit=gross-cogs-exp;
-  return{gross,cogs,expenses:exp,profit,taxRes:Math.max(0,profit*S.settings.tax)};
+  return{gross,cogs,expenses:exp,commissions,supplyCost,profit,taxRes:showTaxRes(sh)};
+}
+// ---- Revenue: Potential vs Actual vs Discounts (Change 2) ----
+function showPotentialRev(sh){
+  let g=0;
+  (sh.days||[]).forEach(d=>{ if(d.morningCount&&d.eveningCount){ g+=calcRev(calcSold(d.morningCount,d.eveningCount)); } });
+  return g;
+}
+function showActualRev(sh){
+  let a=0;
+  (sh.days||[]).forEach(d=>{ if(d.payments) a+=calcPmt(d.payments); });
+  return a;
+}
+function showDiscountTotal(sh){
+  return (sh.discounts||[]).reduce((t,x)=>t+(parseFloat(x.amount)||0),0);
+}
+// ---- Dashboard v9 helpers: show date/state, per-show breakdowns, work hours ----
+function _todayKey(){ return new Date().toISOString().split('T')[0]; }
+function showEndKey(sh){
+  const start=showSortKey(sh);
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(start))return start;
+  const d=new Date(start+'T12:00:00'); d.setDate(d.getDate()+((sh.numDays||1)-1));
+  return d.toISOString().split('T')[0];
+}
+function isMissed(sh){ return sh.status!=='completed' && sh.status!=='active' && showEndKey(sh) < _todayKey(); }
+function isUpcoming(sh){ return sh.status!=='completed' && !isMissed(sh); }
+function showUnitsSold(sh){ const u={}; SKUS.forEach(s=>u[s.key]=0); (sh.days||[]).forEach(d=>{ if(d.morningCount&&d.eveningCount){ const sold=calcSold(d.morningCount,d.eveningCount); SKUS.forEach(s=>u[s.key]+=(sold[s.key]||0)); } }); return u; }
+function showPmtTotals(sh){ const p={}; PMTS.forEach(x=>p[x.key]=0); (sh.days||[]).forEach(d=>{ if(d.payments) PMTS.forEach(x=>p[x.key]+=(parseFloat(d.payments[x.key])||0)); }); return p; }
+function showHours(sh){ return (typeof showWorkHoursTotal==='function')?showWorkHoursTotal(sh):((parseFloat(sh.hoursPerDay)||8)*(sh.numDays||1)); }
+function bestShowCardHTML(sh,label){
+  const t=calcShow(sh), u=showUnitsSold(sh), p=showPmtTotals(sh);
+  const dateStr=sh.dates?(sh.dates.length>1?sh.dates[0]+' - '+sh.dates[sh.dates.length-1]:sh.dates[0]):'';
+  const units=SKUS.filter(s=>(u[s.key]||0)>0).map(s=>`<span class="chip gold" style="font-size:10px">${s.short}: ${u[s.key]}</span>`).join('')||'<span style="color:var(--muted);font-size:11px">No unit data</span>';
+  const pmts=PMTS.filter(x=>(p[x.key]||0)>0).map(x=>`<span class="chip" style="font-size:10px">${x.label}: ${fmt(p[x.key])}</span>`).join('')||'<span style="color:var(--muted);font-size:11px">No payment data</span>';
+  return `<div class="card grb" style="cursor:pointer;margin-bottom:8px" onclick="go('show','${sh.id}')">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--gold);font-weight:800;margin-bottom:4px">${label}</div>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start">
+      <div><div style="font-size:17px;font-weight:900">🏆 ${sh.name}</div><div style="font-size:11px;color:var(--muted)">${sh.location||''} ${dateStr?'· '+dateStr:''}</div></div>
+      <div style="text-align:right"><div style="font-size:20px;font-weight:900;color:${t.profit>=0?'var(--green)':'var(--red)'}">${fmt(t.profit)}</div><div style="font-size:10px;color:var(--muted)">profit</div></div>
+    </div>
+    <div class="g4" style="margin-top:10px">
+      <div style="text-align:center"><div style="font-size:14px;font-weight:900;color:var(--gold)">${fmt(t.gross)}</div><div style="font-size:9px;color:var(--muted)">GROSS</div></div>
+      <div style="text-align:center"><div style="font-size:14px;font-weight:900">${sh.numDays||1}</div><div style="font-size:9px;color:var(--muted)">DAYS</div></div>
+      <div style="text-align:center"><div style="font-size:14px;font-weight:900">${fmt(sh.boothCost||0)}</div><div style="font-size:9px;color:var(--muted)">BOOTH</div></div>
+      <div style="text-align:center"><div style="font-size:14px;font-weight:900">${fmt(t.expenses)}</div><div style="font-size:9px;color:var(--muted)">EXPENSES</div></div>
+    </div>
+    ${t.commissions>0?`<div style="font-size:10px;color:var(--muted);text-align:center;margin-top:6px">Commissions: <strong style="color:var(--red)">${fmt(t.commissions)}</strong></div>`:''}
+    <div style="margin-top:8px;font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700">Units Sold</div>
+    <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:3px">${units}</div>
+    <div style="margin-top:8px;font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700">Payments Collected</div>
+    <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:3px">${pmts}</div>
+  </div>`;
 }
 function calcYTD(){
   let gross=0,cogs=0,expenses=0,units={};
   SKUS.forEach(s=>units[s.key]=0);
   let pmtTotals={cash:0,square:0,venmo:0,paypal:0,cashapp:0,zelle:0};
-  let miles=0;
+  let miles=0,gas=0,taxResSum=0;
   // Completed shows: gross, cogs, and all show-level expenses (booth + daily gas/food/etc)
   S.shows.filter(s=>s.status==='completed').forEach(sh=>{
     const t=calcShow(sh);gross+=t.gross;cogs+=t.cogs;expenses+=t.expenses;
-    miles+=(sh.miles||0)*2*(sh.numDays||1);
+    taxResSum+=t.taxRes;
+    miles+=showMiles(sh);
+    gas+=showGas(sh);
     (sh.days||[]).forEach(d=>{
       if(d.morningCount&&d.eveningCount){const sold=calcSold(d.morningCount,d.eveningCount);SKUS.forEach(s=>units[s.key]+=(sold[s.key]||0));}
       if(d.payments)PMTS.forEach(p=>pmtTotals[p.key]+=(parseFloat(d.payments[p.key])||0));
@@ -449,10 +528,10 @@ function calcYTD(){
   expenses+=otherSpend;
   // True profit = gross minus every dollar that left your pocket
   const profit=gross-cogs-expenses;
-  const taxRes=Math.max(0,profit*S.settings.tax);
+  const taxRes=taxResSum;
   const keep=Math.max(0,profit-taxRes);
   const totalUnits=Object.values(units).reduce((a,b)=>a+b,0);
-  return{gross,cogs,expenses,profit,taxRes,keep,units,totalUnits,pmtTotals,miles,otherSpend};
+  return{gross,cogs,expenses,profit,taxRes,keep,units,totalUnits,pmtTotals,miles,gas,otherSpend};
 }
 function toast(msg,dur=2200){const el=$$('toast');el.textContent=msg;el.style.display='block';clearTimeout(el._t);el._t=setTimeout(()=>el.style.display='none',dur);}
 function boothPaid(sh){return(sh.boothPayments||[]).reduce((t,p)=>t+(parseFloat(p.amount)||0),0);}
@@ -514,72 +593,131 @@ function rHome(){
   const invCost=calcInvCost(S.inventory);
   const invRetail=calcInvRetail(S.inventory);
   const invUnits=SKUS.reduce((t,s)=>t+(S.inventory[s.key]||0),0);
-  const active=S.shows.find(s=>s.status==='active');
+  const activeShows=S.shows.filter(s=>s.status==='active');
   const done=S.shows.filter(s=>s.status==='completed');
-  const planned=[...S.shows].filter(s=>s.status!=='completed').sort((a,b)=>showSortKey(a)<showSortKey(b)?-1:showSortKey(a)>showSortKey(b)?1:0);
-  const avgProfit=done.length?ytd.profit/done.length:0;
-  const keep=ytd.keep;
-  const keepPct=ytd.profit>0?Math.round((keep/ytd.profit)*100):0;
-  const taxPct=ytd.profit>0?Math.round((ytd.taxRes/ytd.profit)*100):0;
+  const upcomingShows=[...S.shows].filter(s=>isUpcoming(s)&&s.status!=='active').sort((a,b)=>showSortKey(a)<showSortKey(b)?-1:1);
+  const missedShows=S.shows.filter(s=>isMissed(s));
+  const plannedCount=upcomingShows.length+activeShows.length;
+  const nextUp=upcomingShows[0]||null;
+  const completedNet=done.reduce((t,sh)=>t+calcShow(sh).profit,0);
+  const avgShowProfit=done.length?completedNet/done.length:0;
+  const avgShowGross=done.length?ytd.gross/done.length:0;
+  const upcomingDeposits=[...S.shows].filter(s=>s.status!=='completed').reduce((t,sh)=>t+boothPaid(sh),0);
+  const overhead=(ytd.otherSpend||0)+upcomingDeposits;
+  const taxRes=ytd.taxRes;
+  const cleanKeep=Math.max(0,completedNet-taxRes);
+  const keepPct=completedNet>0?Math.round((cleanKeep/completedNet)*100):0;
+  const taxPct=completedNet>0?Math.round((taxRes/completedNet)*100):0;
   const mileDeduct=ytd.miles*S.settings.irsRate;
-
-  // Best show this season
-  let bestShow=null,bestProfit=-Infinity;
-  done.forEach(sh=>{const t=calcShow(sh);if(t.profit>bestProfit){bestProfit=t.profit;bestShow=sh;}});
-
-  // YTD payment totals
+  const plannedDays=[...upcomingShows,...activeShows].reduce((t,sh)=>t+(sh.numDays||1),0);
+  const completedDays=done.reduce((t,sh)=>t+(sh.numDays||1),0);
+  const plannedHours=[...upcomingShows,...activeShows].reduce((t,sh)=>t+showHours(sh),0);
+  const completedHours=done.reduce((t,sh)=>t+showHours(sh),0);
+  const bookedShowsW=(S.shows||[]).filter(sh=>!isMissed(sh));
+  const bookedCount=bookedShowsW.length;
+  const bookedShowDays=bookedShowsW.reduce((t,sh)=>t+(sh.numDays||1),0);
+  const totalStaffedHours=bookedShowsW.reduce((t,sh)=>t+staffedHours(sh),0);
+  const _ownerId=((S.reps||[]).find(r=>r.isSelf)||{}).id;
+  const myHoursTotal=(S.shows||[]).reduce((t,sh)=>{ const h=(_ownerId&&sh.repHours&&sh.repHours[_ownerId]!=null)?parseFloat(sh.repHours[_ownerId]):parseFloat(sh.myHours); return t+(h||0); },0);
+  let bestGross=null,bgVal=-Infinity,bestProfit=null,bpVal=-Infinity;
+  done.forEach(sh=>{const t=calcShow(sh); if(t.gross>bgVal){bgVal=t.gross;bestGross=sh;} if(t.profit>bpVal){bpVal=t.profit;bestProfit=sh;}});
   const pmtGrand=PMTS.reduce((t,p)=>t+(ytd.pmtTotals[p.key]||0),0);
-
-  // vs 2025
-  const profitDiff=ytd.profit-PREV_YEAR.net;
-  const grossDiff=ytd.gross-PREV_YEAR.gross;
-
-  // Low stock items
   const lowStock=SKUS.filter(s=>(S.inventory[s.key]||0)<5);
-
   let html='';
 
-  // ---- ACTIVE SHOW BANNER ----
-  if(active){
-    const t=calcShow(active);
-    const dateStr=active.dates?(active.dates.length>1?active.dates[0]+' - '+active.dates[active.dates.length-1]:active.dates[0]):'';
-    html+=`
-    <div class="card gb" style="cursor:pointer" onclick="go('show','${active.id}')">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-        <div style="display:flex;align-items:center;gap:9px">
-          <span style="font-size:26px">🔴</span>
-          <div>
-            <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--gold);font-weight:800">ACTIVE SHOW</div>
-            <div style="font-size:19px;font-weight:900">${active.name}</div>
-            <div style="font-size:11px;color:var(--muted)">${active.location||''} ${dateStr?'· '+dateStr:''}</div>
+  // ---- ACTIVE SHOW BANNERS (one card per active show — no cap) ----
+  if(activeShows.length){
+    html+=`<div class="sec-lbl">🔴 ${activeShows.length>1?`ACTIVE SHOWS (${activeShows.length})`:'ACTIVE SHOW'}</div>`;
+    activeShows.forEach(a=>{
+      const t=calcShow(a);
+      const dateStr=a.dates?(a.dates.length>1?a.dates[0]+' - '+a.dates[a.dates.length-1]:a.dates[0]):'';
+      const daysDone=(a.days||[]).filter(d=>d.morningCount&&d.eveningCount).length;
+      const aActual=showActualRev(a), aDisc=showDiscountTotal(a);
+      html+=`
+      <div class="card gb" style="cursor:pointer;margin-bottom:8px" onclick="go('show','${a.id}')">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <div style="display:flex;align-items:center;gap:9px">
+            <span style="font-size:26px">🔴</span>
+            <div>
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--gold);font-weight:800">ACTIVE SHOW</div>
+              <div style="font-size:19px;font-weight:900">${a.name}</div>
+              <div style="font-size:11px;color:var(--muted)">${a.location||''} ${dateStr?'· '+dateStr:''}</div>
+            </div>
           </div>
+          <span style="color:var(--gold);font-size:22px;margin-right:2px">→</span>
         </div>
-        <span style="color:var(--gold);font-size:22px;margin-right:2px">→</span>
-      </div>
-      <div class="g4">
-        <div style="text-align:center"><div style="font-size:17px;font-weight:900;color:var(--gold)">${fmt(t.gross)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Gross</div></div>
-        <div style="text-align:center"><div style="font-size:17px;font-weight:900;color:${t.profit>=0?'var(--green)':'var(--red)}'}">${fmt(t.profit)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Profit</div></div>
-        <div style="text-align:center"><div style="font-size:17px;font-weight:900;color:var(--gold)">${fmt(t.cogs)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">COGS</div></div>
-        <div style="text-align:center"><div style="font-size:17px;font-weight:900;color:var(--gold)">${active.days.filter(d=>d.morningCount&&d.eveningCount).length}/${active.numDays}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Days</div></div>
-      </div>
-    </div>`;
+        <div class="g4">
+          <div style="text-align:center"><div style="font-size:17px;font-weight:900;color:var(--gold)">${fmt(t.gross)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Potential</div></div>
+          <div style="text-align:center"><div style="font-size:17px;font-weight:900;color:var(--green)">${fmt(aActual)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Collected</div></div>
+          <div style="text-align:center"><div style="font-size:17px;font-weight:900;color:${t.profit>=0?'var(--green)':'var(--red)'}">${fmt(t.profit)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Profit</div></div>
+          <div style="text-align:center"><div style="font-size:17px;font-weight:900;color:var(--gold)">${daysDone}/${a.numDays}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Days</div></div>
+        </div>
+        ${aDisc>0?`<div style="text-align:center;font-size:10px;color:var(--muted);margin-top:6px">Discounts/freebies logged: <strong style="color:var(--red)">${fmt(aDisc)}</strong></div>`:''}
+      </div>`;
+    });
   }
 
-  // ---- SEASON OVERVIEW ----
+  // ---- NEXT UP + SHOWS BUTTONS ----
+  html+=`<div class="sec-lbl">NEXT UP</div>`;
+  if(nextUp){
+    const nuDate=nextUp.dates?(nextUp.dates.length>1?nextUp.dates[0]+' - '+nextUp.dates[nextUp.dates.length-1]:nextUp.dates[0]):'';
+    const nuGas=showGas(nextUp);
+    html+=`<div class="card" style="cursor:pointer;margin-bottom:8px" onclick="go('show','${nextUp.id}')">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div><div style="font-size:17px;font-weight:900">📅 ${nextUp.name}</div><div style="font-size:11px;color:var(--muted)">${nextUp.location?nextUp.location+' · ':''}${nuDate} · ${nextUp.numDays} day${nextUp.numDays>1?'s':''}</div></div>
+        <div style="text-align:right"><div style="font-size:13px;font-weight:700">${fmt(nextUp.boothCost||0)} booth</div><div style="font-size:11px;color:var(--muted)">${nextUp.miles?nextUp.miles+' mi · ~'+fmt(nuGas)+' gas':''}</div></div>
+      </div>
+    </div>`;
+  } else if(!activeShows.length){
+    html+=`<div class="card" style="text-align:center;color:var(--muted);font-size:13px;margin-bottom:8px">No upcoming shows. Tap + New Show to add one.</div>`;
+  }
+  html+=`<div class="g2" style="margin-bottom:8px;gap:8px">
+    <button class="btn btn-ghost" onclick="showsTab='upcoming';go('shows')">📅 Upcoming Shows (${plannedCount})</button>
+    <button class="btn btn-ghost" onclick="showsTab='completed';go('shows')">✅ Completed Shows (${done.length})</button>
+  </div>
+  ${missedShows.length?`<button class="btn btn-ghost btn-full" style="margin-bottom:8px;border-color:var(--redbd);color:var(--red)" onclick="showsTab='missed';go('shows')">⚠️ Missed / Did Not Do (${missedShows.length})</button>`:''}`;
+
+  // ---- SEASON OVERVIEW (completed-show economics; overhead separate) ----
   html+=`<div class="sec-lbl">2026 SEASON OVERVIEW</div>
   <div class="g2" style="margin-bottom:8px">
-    <div class="sbox gb"><div class="sl">YTD GROSS SALES</div><div class="sv">${fmt(ytd.gross)}</div><div class="ss">${done.length} show${done.length!==1?'s':''} completed</div></div>
-    <div class="sbox ${ytd.keep>=0?'grb':'rb'}"><div class="sl">AFTER-TAX KEEP</div><div class="sv ${ytd.keep>=0?'g':'r'}">${fmt(ytd.keep)}</div><div class="ss">What you actually pocket</div></div>
+    <div class="sbox gb"><div class="sl">YTD GROSS (completed)</div><div class="sv">${fmt(ytd.gross)}</div><div class="ss">${done.length} show${done.length!==1?'s':''} completed</div></div>
+    <div class="sbox ${completedNet>=0?'grb':'rb'}"><div class="sl">COMPLETED SHOWS NET</div><div class="sv ${completedNet>=0?'g':'r'}">${fmt(completedNet)}</div><div class="ss">Sum of each show's profit</div></div>
   </div>
   <div class="g3" style="margin-bottom:8px">
     <div class="sbox"><div class="sl">TOTAL COGS</div><div class="sv sm w">${fmt(ytd.cogs)}</div><div class="ss">Product cost</div></div>
-    <div class="sbox"><div class="sl">TOTAL EXPENSES</div><div class="sv sm w">${fmt(ytd.expenses)}</div><div class="ss">Booth + travel + supplies + misc</div></div>
-    <div class="sbox rb"><div class="sl">TAX RESERVE</div><div class="sv sm r">${fmt(ytd.taxRes)}</div><div class="ss">${Math.round(S.settings.tax*100)}% set aside</div></div>
+    <div class="sbox"><div class="sl">AVG / SHOW PROFIT</div><div class="sv sm ${avgShowProfit>=0?'g':'r'}">${fmt(avgShowProfit)}</div><div class="ss">Completed only</div></div>
+    <div class="sbox"><div class="sl">AVG / SHOW GROSS</div><div class="sv sm w">${fmt(avgShowGross)}</div><div class="ss">Completed only</div></div>
   </div>
-  <div class="g3" style="margin-bottom:8px">
-    <div class="sbox"><div class="sl">UNITS SOLD</div><div class="sv sm w">${fmtN(ytd.totalUnits)}</div><div class="ss">YTD total</div></div>
-    <div class="sbox"><div class="sl">AVG/SHOW</div><div class="sv sm w">${fmt(avgProfit)}</div><div class="ss">Avg profit</div></div>
-    <div class="sbox"><div class="sl">SHOWS DONE</div><div class="sv sm w">${done.length}</div><div class="ss">${planned.length} planned</div></div>
+  <div class="g2" style="margin-bottom:8px">
+    <div class="sbox rb"><div class="sl">TAX RESERVE</div><div class="sv sm r">${fmt(ytd.taxRes)}</div><div class="ss">${Math.round(S.settings.tax*100)}% of card sales</div></div>
+    <div class="sbox"><div class="sl">BUSINESS OVERHEAD</div><div class="sv sm w">${fmt(overhead)}</div><div class="ss">Supplies + upcoming deposits (separate)</div></div>
+  </div>`;
+
+  // ---- UNITS SOLD BY PRODUCT ----
+  html+=`<div class="sec-lbl">UNITS SOLD — BY PRODUCT</div>
+  <div class="card">
+    <div class="sr" style="border-bottom:1px solid var(--border);margin-bottom:4px"><span class="srl b">Total Units (completed)</span><span class="srv lg" style="color:var(--gold)">${fmtN(ytd.totalUnits)}</span></div>
+    ${SKUS.map(s=>{const u=ytd.units[s.key]||0;const rev=u*getP(s.key);return`<div class="sr"><span class="srl">${s.emoji} ${s.name}</span><span class="srv">${u} units · <span style="color:var(--gold)">${fmt(rev)}</span></span></div>`;}).join('')}
+  </div>`;
+
+  // ---- WORKLOAD ----
+  html+=`<div class="sec-lbl">WORKLOAD</div>
+  <div class="card">
+    <div class="g3" style="margin-bottom:8px">
+      <div style="text-align:center"><div style="font-size:19px;font-weight:900;color:var(--green)">${done.length}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Shows Done</div></div>
+      <div style="text-align:center"><div style="font-size:19px;font-weight:900;color:var(--gold)">${plannedCount}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Shows Planned</div></div>
+      <div style="text-align:center"><div style="font-size:19px;font-weight:900;color:${missedShows.length?'var(--red)':'var(--muted)'}">${missedShows.length}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Missed</div></div>
+    </div>
+    <div class="sr"><span class="srl b">Shows booked</span><span class="srv">${bookedCount}</span></div>
+    <div class="sr"><span class="srl">Booked show-days <span style="color:var(--muted)">(stacks overlaps)</span></span><span class="srv">${bookedShowDays}</span></div>
+    <div class="sr"><span class="srl b">Total staffed hours ⚡</span><span class="srv gold">${fmtN(totalStaffedHours)}h</span></div>
+    <div class="sr"><span class="srl">My hours (you)</span><span class="srv">${fmtN(myHoursTotal)}h</span></div>
+    <div style="height:6px"></div>
+    <div class="sr"><span class="srl">Planned show days</span><span class="srv">${plannedDays}</span></div>
+    <div class="sr"><span class="srl">Completed show days</span><span class="srv">${completedDays}</span></div>
+    <div class="sr"><span class="srl">Est. planned work hours</span><span class="srv">${fmtN(plannedHours)}h</span></div>
+    <div class="sr"><span class="srl">Completed work hours</span><span class="srv">${fmtN(completedHours)}h</span></div>
+    <div style="font-size:10px;color:var(--muted);margin-top:6px">⚡ Staffed hours = each show-day's hours × people working it (reps + you), so two shows running at once count double. "My hours" is logged per show in Edit Show.</div>
   </div>`;
 
   // ---- BOOTH COSTS — full season committed ----
@@ -598,19 +736,16 @@ function rHome(){
     ${unpaidList.length?`<div style="padding-top:8px;border-top:1px solid var(--border)">${unpaidList.map(sh=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border);font-size:12px"><span style="font-weight:700">${sh.name}</span><div style="display:flex;align-items:center;gap:6px"><span style="color:var(--red);font-weight:900">${fmt(boothBalance(sh))} owed</span><button class="btn btn-green btn-xs" onclick="openBoothPmt('${sh.id}')">+ Pay</button></div></div>`).join('')}</div>`:'<div style="font-size:12px;color:var(--green);text-align:center;padding-top:4px">✅ All booth fees paid</div>'}
   </div>`;
 
-  // ---- OTHER EXPENSES (supplies, equipment, misc) ----
-  const otherExp=S.otherExpenses||[];
-  const recentOther=[...otherExp].reverse().slice(0,5);
-  html+=`<div class="sec-lbl">OTHER EXPENSES — SUPPLIES & MISC</div>
+  // ---- OTHER EXPENSES (button + YTD total only; full itemized list lives in openManageExpenses) ----
+  html+=`<div class="sec-lbl">OTHER EXPENSES</div>
   <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:${otherExp.length?10:0}px">
+    <div style="display:flex;justify-content:space-between;align-items:center">
       <div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:2px">YTD Spent</div>
         <div style="font-size:24px;font-weight:900;color:var(--red)">${fmt(ytd.otherSpend)}</div>
       </div>
-      <button class="btn btn-gold btn-sm" onclick="openOtherExpense()">+ Log Expense</button>
+      <button class="btn btn-gold btn-sm" onclick="openManageExpenses()">Other Expenses →</button>
     </div>
-    ${recentOther.length?`<div style="border-top:1px solid var(--border);padding-top:8px">${recentOther.map(e=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border);font-size:12px"><div><span style="font-weight:700">${e.note||e.category||'Expense'}</span><span style="color:var(--muted);font-size:10px;margin-left:6px">${e.category?'['+e.category+']':''}</span></div><div style="text-align:right"><span style="color:var(--red);font-weight:900">${fmt(e.amount)}</span><span style="color:var(--muted);font-size:10px;margin-left:6px">${e.date}</span></div></div>`).join('')}</div>`:'<div style="font-size:12px;color:var(--muted);text-align:center;padding:4px 0">No expenses logged yet. Track bags, paper towels, equipment, etc.</div>'}
   </div>`;
 
   // ---- MARK MARTONE PRODUCT DEBT ----
@@ -630,17 +765,17 @@ function rHome(){
     <button class="btn btn-ghost btn-sm btn-full" style="margin-top:10px" onclick="openDebtPmt()">+ Log Payment to Mark</button>
   </div>`;
 
-  // ---- TAX + KEEP ----
-  html+=`<div class="sec-lbl">MONEY SPLIT</div>
+  // ---- MONEY SPLIT (from COMPLETED shows; overhead shown separately) ----
+  html+=`<div class="sec-lbl">MONEY SPLIT — COMPLETED SHOWS</div>
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
       <div>
         <div style="font-size:11px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:3px">Clean Keep (after ${taxPct}% tax)</div>
-        <div style="font-size:28px;font-weight:900;color:var(--green)">${fmt(keep)}</div>
+        <div style="font-size:28px;font-weight:900;color:var(--green)">${fmt(cleanKeep)}</div>
       </div>
       <div style="text-align:right">
         <div style="font-size:11px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:3px">Set Aside for Tax</div>
-        <div style="font-size:24px;font-weight:900;color:var(--red)">${fmt(ytd.taxRes)}</div>
+        <div style="font-size:24px;font-weight:900;color:var(--red)">${fmt(taxRes)}</div>
       </div>
     </div>
     <div style="display:flex;gap:4px;height:12px;border-radius:6px;overflow:hidden">
@@ -651,6 +786,7 @@ function rHome(){
       <span>Keep: ${keepPct}%</span>
       <span>Tax: ${taxPct}%</span>
     </div>
+    <div style="font-size:10px;color:var(--muted);margin-top:8px;border-top:1px solid var(--border);padding-top:6px">Completed-show net <strong>${fmt(completedNet)}</strong> − tax <strong>${fmt(taxRes)}</strong> = clean keep. Business overhead <strong>${fmt(overhead)}</strong> (supplies + upcoming deposits) is tracked separately.</div>
   </div>`;
 
   // ---- PAYMENT BREAKDOWN ----
@@ -688,21 +824,7 @@ function rHome(){
     <div style="margin-top:10px;font-size:12px;color:var(--muted)">Potential margin on current stock: <strong style="color:var(--green)">${fmt(invRetail-invCost)}</strong></div>
   </div>`;
 
-  // ---- YTD UNITS SOLD BY SKU ----
-  if(ytd.totalUnits>0){
-    html+=`<div class="sec-lbl">UNITS SOLD YTD (BY PRODUCT)</div>
-    <div class="card">
-      ${SKUS.map(s=>{const u=ytd.units[s.key]||0;const pct=ytd.totalUnits>0?Math.round((u/ytd.totalUnits)*100):0;const rev=u*getP(s.key);return`
-      <div style="margin-bottom:10px">
-        <div style="display:flex;justify-content:space-between;margin-bottom:4px">
-          <span style="font-size:13px;font-weight:700">${s.emoji} ${s.name}</span>
-          <span style="font-size:13px;font-weight:900;color:var(--gold)">${u} units · ${fmt(rev)}</span>
-        </div>
-        <div class="pbar-wrap"><div class="pbar-fill" style="width:${pct}%;background:var(--gold)"></div></div>
-        <div style="font-size:10px;color:var(--muted);margin-top:2px">${pct}% of total units sold</div>
-      </div>`;}).join('')}
-    </div>`;
-  }
+  // (Units-by-product now shown compactly in the Season Overview area above)
 
   // ---- MILEAGE DEDUCTION ----
   if(ytd.miles>0){
@@ -711,102 +833,21 @@ function rHome(){
       <div class="g3">
         <div style="text-align:center"><div style="font-size:19px;font-weight:900;color:var(--gold)">${fmtN(ytd.miles)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Total Miles</div></div>
         <div style="text-align:center"><div style="font-size:19px;font-weight:900;color:var(--green)">${fmt(mileDeduct)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">IRS Deduction</div></div>
-        <div style="text-align:center"><div style="font-size:19px;font-weight:900;color:var(--text)">${fmt(ytd.miles/S.settings.mpg*S.settings.gasPrice)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Gas Spent</div></div>
+        <div style="text-align:center"><div style="font-size:19px;font-weight:900;color:var(--text)">${fmt(ytd.gas!=null?ytd.gas:ytd.miles/S.settings.mpg*S.settings.gasPrice)}</div><div style="font-size:9px;color:var(--muted);text-transform:uppercase">Gas Spent</div></div>
       </div>
       <div style="margin-top:10px;font-size:11px;color:var(--muted)">Rate: $${S.settings.irsRate}/mile · MPG: ${S.settings.mpg} · Gas: $${S.settings.gasPrice}/gal</div>
     </div>`;
   }
 
-  // ---- BEST SHOW THIS SEASON ----
-  if(bestShow){
-    const bt=calcShow(bestShow);
-    html+=`<div class="sec-lbl">BEST SHOW THIS SEASON</div>
-    <div class="card grb" style="cursor:pointer" onclick="go('show','${bestShow.id}')">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start">
-        <div><div style="font-size:18px;font-weight:900">🏆 ${bestShow.name}</div><div style="font-size:11px;color:var(--muted)">${bestShow.location||''} ${bestShow.dates?'· '+bestShow.dates.join(' → '):''}</div></div>
-        <div style="text-align:right"><div style="font-size:22px;font-weight:900;color:var(--green)">${fmt(bt.profit)}</div><div style="font-size:11px;color:var(--muted)">profit</div></div>
-      </div>
-      <div class="g4" style="margin-top:10px">
-        <div style="text-align:center"><div style="font-size:15px;font-weight:900;color:var(--gold)">${fmt(bt.gross)}</div><div style="font-size:9px;color:var(--muted)">GROSS</div></div>
-        <div style="text-align:center"><div style="font-size:15px;font-weight:900">${fmt(bt.cogs)}</div><div style="font-size:9px;color:var(--muted)">COGS</div></div>
-        <div style="text-align:center"><div style="font-size:15px;font-weight:900">${fmt(bt.expenses)}</div><div style="font-size:9px;color:var(--muted)">EXPENSES</div></div>
-        <div style="text-align:center"><div style="font-size:15px;font-weight:900;color:var(--red)">${fmt(bt.taxRes)}</div><div style="font-size:9px;color:var(--muted)">TAX RES.</div></div>
-      </div>
-    </div>`;
+  // ---- BEST SHOWS: highest grossing + highest profit (completed) ----
+  if(bestGross||bestProfit){
+    html+=`<div class="sec-lbl">BEST SHOWS THIS SEASON</div>`;
+    if(bestGross)html+=bestShowCardHTML(bestGross,'🥇 Highest Grossing Show');
+    if(bestProfit&&bestProfit!==bestGross)html+=bestShowCardHTML(bestProfit,'💰 Highest Profit Show');
+    else if(bestProfit&&bestProfit===bestGross)html+=`<div style="font-size:11px;color:var(--muted);margin:-2px 0 8px;text-align:center">Same show is both highest grossing and highest profit.</div>`;
   }
 
-  // ---- VS 2025 ----
-  html+=`<div class="sec-lbl">2026 vs 2025 COMPARISON</div>
-  <div class="card">
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;text-align:center;margin-bottom:12px">
-      <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;padding-bottom:6px">METRIC</div>
-      <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;padding-bottom:6px">2025 FINAL</div>
-      <div style="font-size:10px;color:var(--gold);text-transform:uppercase;font-weight:700;padding-bottom:6px">2026 YTD</div>
-    </div>
-    ${[
-      {lbl:'Gross',v25:PREV_YEAR.gross,v26:ytd.gross},
-      {lbl:'Net Profit',v25:PREV_YEAR.net,v26:ytd.profit},
-      {lbl:'Shows Done',v25:PREV_YEAR.shows,v26:done.length,isCnt:true},
-      {lbl:'Best Show',v25:PREV_YEAR.bestProfit,v26:bestProfit>-Infinity?bestProfit:0},
-    ].map(row=>{
-      const diff=row.v26-row.v25;
-      const better=diff>0;
-      return`<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;padding:8px 0;border-top:1px solid var(--border);align-items:center;text-align:center">
-        <div style="font-size:13px;font-weight:700;text-align:left">${row.lbl}</div>
-        <div style="font-size:13px;color:var(--muted)">${row.isCnt?row.v25:fmt(row.v25)}</div>
-        <div style="font-size:13px;font-weight:900;color:var(--gold)">${row.isCnt?row.v26:fmt(row.v26)} <span style="font-size:10px;color:${better?'var(--green)':'var(--red)'}">${better?'▲':'▼'} ${row.isCnt?Math.abs(diff):fmt(Math.abs(diff))}</span></div>
-      </div>`;
-    }).join('')}
-    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)">2025 best show: ${PREV_YEAR.bestShow} — ${fmt(PREV_YEAR.bestProfit)} profit</div>
-  </div>`;
-
-  // ---- UPCOMING SHOWS ----
-  if(planned.length){
-    html+=`<div class="sec-lbl">UPCOMING SHOWS (${planned.length})</div>`;
-    planned.forEach(sh=>{
-      const dateStr=sh.dates?(sh.dates.length>1?sh.dates[0]+' - '+sh.dates[sh.dates.length-1]:sh.dates[0]):'';
-      const gasEst=sh.miles?(sh.miles*2*sh.numDays/S.settings.mpg*S.settings.gasPrice):0;
-      html+=`<div class="card" style="cursor:pointer" onclick="go('show','${sh.id}')">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div>
-            <div style="font-size:16px;font-weight:900">📅 ${sh.name}</div>
-            <div style="font-size:11px;color:var(--muted)">${sh.location?sh.location+' · ':''}${dateStr} · ${sh.numDays} day${sh.numDays>1?'s':''}</div>
-          </div>
-          <div style="text-align:right">
-            <div style="font-size:13px;font-weight:700">${fmt(sh.boothCost||0)} booth</div>
-            <div style="font-size:11px;color:var(--muted)">${sh.miles?sh.miles+' mi · est. '+fmt(gasEst)+' gas':''}</div>
-          </div>
-        </div>
-      </div>`;
-    });
-  }
-
-  // ---- RECENT COMPLETED ----
-  if(done.length){
-    html+=`<div class="sec-lbl">COMPLETED SHOWS</div>`;
-    done.slice(-5).reverse().forEach(sh=>{
-      const t=calcShow(sh);
-      const dateStr=sh.dates?(sh.dates.length>1?sh.dates[0]+' - '+sh.dates[sh.dates.length-1]:sh.dates[0]):'';
-      const margin=t.gross>0?Math.round((t.profit/t.gross)*100):0;
-      html+=`<div class="card sd" style="cursor:pointer" onclick="go('show','${sh.id}')">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start">
-          <div style="flex:1">
-            <div style="font-weight:900;font-size:15px">${sh.name}</div>
-            <div style="font-size:11px;color:var(--muted)">${sh.location?sh.location+' · ':''}${dateStr}</div>
-            <div style="margin-top:6px;display:flex;gap:5px;flex-wrap:wrap">
-              <span class="chip">${fmt(t.gross)} gross</span>
-              <span class="chip">${fmt(t.cogs)} COGS</span>
-              <span class="chip">${fmt(t.expenses)} exp</span>
-            </div>
-          </div>
-          <div style="text-align:right;margin-left:10px">
-            <div style="font-size:20px;font-weight:900;color:${t.profit>=0?'var(--green)':'var(--red)}'}">${fmt(t.profit)}</div>
-            <div style="font-size:11px;color:var(--muted)">margin: ${margin}%</div>
-          </div>
-        </div>
-      </div>`;
-    });
-  }
+  // (vs-2025 table + full Upcoming/Completed lists moved off home — lists live on the Shows page)
 
   // ---- QUICK ACTIONS ----
   html+=`<div class="sec-lbl">QUICK ACTIONS</div>
@@ -815,8 +856,8 @@ function rHome(){
     <button class="btn btn-ghost" onclick="showSetAllInv()">📋 Update Stock</button>
   </div>
   <button class="btn btn-ghost btn-full" style="margin-bottom:14px" onclick="exportCalICS()">📅 Export Shows to Calendar</button>
-  ${active?`<button class="btn btn-gold btn-full" style="margin-bottom:14px" onclick="go('show','${active.id}')">🔴 Open Active Show: ${active.name}</button>`:''}
-  <div style="text-align:center;font-size:11px;color:var(--muted);padding-bottom:4px">Best Solution App · Dot Dynasty LLC · v6.1</div>
+  ${activeShows.map(a=>`<button class="btn btn-gold btn-full" style="margin-bottom:14px" onclick="go('show','${a.id}')">🔴 Open Active Show: ${a.name}</button>`).join('')}
+  <div style="text-align:center;font-size:11px;color:var(--muted);padding-bottom:4px">Best Solution App · Dot Dynasty LLC · v6.3</div>
   `;
 
   pg('home').innerHTML=html;
@@ -833,6 +874,21 @@ function rStock(){
     <div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Cost Basis</div><div style="font-size:22px;font-weight:900">${fmt(cost)}</div></div>
     <div style="text-align:right"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Retail Value</div><div style="font-size:22px;font-weight:900;color:var(--gold)">${fmt(retail)}</div></div>
   </div>
+  <div style="display:flex;gap:8px;margin-bottom:12px">
+    <button class="btn btn-ghost btn-sm" style="flex:1;border-color:rgba(79,195,247,0.4);color:#7EB8F7" onclick="openTransferModal()">🔄 Transfer Stock Between Shows</button>
+  </div>
+  ${(()=>{
+    const packed=transferableShows().filter(s=>s.packedInventory&&Object.values(s.packedInventory).some(v=>(v||0)!==0));
+    if(!packed.length)return'';
+    return `<div class="card" style="margin-bottom:12px;border-color:rgba(79,195,247,0.3)">
+      <div style="font-size:10px;color:var(--blue);text-transform:uppercase;font-weight:700;margin-bottom:8px">📦 Packed To Shows — On-Hand At Booths</div>
+      ${packed.map(s=>`<div class="sr"><span class="srl">${s.name}${s.status==='active'?' 🔴':''}</span><span class="srv" style="font-size:11px;font-weight:600">${SKUS.filter(k=>(s.packedInventory[k.key]||0)!==0).map(k=>k.short+': '+(s.packedInventory[k.key]||0)).join(' · ')||'—'}</span></div>`).join('')}
+    </div>`;
+  })()}
+  ${(S.transfers||[]).length?`<div class="card" style="margin-bottom:12px">
+    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:8px">🔄 Transfer Log</div>
+    ${[...(S.transfers||[])].slice().reverse().slice(0,12).map(tr=>{const sName=(SKUS.find(s=>s.key===tr.sku)||{}).short||tr.sku;return`<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;padding:4px 0;border-bottom:1px solid var(--border)"><span style="min-width:0;flex:1"><strong>${tr.qty} ${sName}</strong> · ${tr.fromName} → ${tr.toName}<span style="color:var(--muted)"> · ${tr.date||''}</span></span><span title="Undo" style="cursor:pointer;color:var(--muted);font-weight:900;padding-left:8px" onclick="delTransfer('${tr.id}')">↩︎</span></div>`;}).join('')}
+  </div>`:''}
   ${SKUS.map(s=>{
     const q=S.inventory[s.key]||0;const val=q*s.cost;const margin=Math.round(((getP(s.key)-s.cost)/getP(s.key))*100);const low=q<5;
     return`<div class="card ${low?'rb':''}">
@@ -881,22 +937,199 @@ function showSortKey(sh){
   return sh.createdAt||'9999';
 }
 function rShows(){
-  const today=new Date().toISOString().split('T')[0];
-  const upcoming=[...S.shows].filter(s=>showSortKey(s)>=today).sort((a,b)=>showSortKey(a)<showSortKey(b)?-1:showSortKey(a)>showSortKey(b)?1:0);
-  const past=[...S.shows].filter(s=>showSortKey(s)<today).sort((a,b)=>showSortKey(a)<showSortKey(b)?-1:showSortKey(a)>showSortKey(b)?1:0);
-  const all=[...upcoming,...past];
+  const upcoming=[...S.shows].filter(s=>isUpcoming(s)).sort((a,b)=>showSortKey(a)<showSortKey(b)?-1:showSortKey(a)>showSortKey(b)?1:0);
+  const completed=[...S.shows].filter(s=>s.status==='completed').sort((a,b)=>showSortKey(a)>showSortKey(b)?-1:showSortKey(a)<showSortKey(b)?1:0);
+  const missed=[...S.shows].filter(s=>isMissed(s)).sort((a,b)=>showSortKey(a)>showSortKey(b)?-1:showSortKey(a)<showSortKey(b)?1:0);
+  const tab=(showsTab==='completed')?'completed':(showsTab==='missed'?'missed':'upcoming');
+  const list=tab==='completed'?completed:(tab==='missed'?missed:upcoming);
   let h=`<div class="sec-row"><div class="sec-title">🎪 Shows</div><button class="btn btn-gold btn-sm" onclick="showNewShowModal()">+ New Show</button></div>`;
-  if(all.length){h+=all.map(s=>showCard(s)).join('');}
-  else{h+=`<div class="empty"><div class="ei">🎪</div>No shows yet. Tap + New Show to start.</div>`;}
+  h+=`<div style="display:flex;gap:6px;margin-bottom:12px">
+    <button class="btn ${tab==='upcoming'?'btn-gold':'btn-ghost'} btn-sm" style="flex:1;padding-left:4px;padding-right:4px" onclick="showsTab='upcoming';rShows()">📅 Upcoming (${upcoming.length})</button>
+    <button class="btn ${tab==='completed'?'btn-gold':'btn-ghost'} btn-sm" style="flex:1;padding-left:4px;padding-right:4px" onclick="showsTab='completed';rShows()">✅ Completed (${completed.length})</button>
+    <button class="btn ${tab==='missed'?'btn-gold':'btn-ghost'} btn-sm" style="flex:1;padding-left:4px;padding-right:4px${(missed.length&&tab!=='missed')?';border-color:var(--redbd);color:var(--red)':''}" onclick="showsTab='missed';rShows()">⚠️ Missed (${missed.length})</button>
+  </div>`;
+  if(tab==='missed'&&missed.length){h+=`<div class="wb red" style="margin-bottom:10px">These shows' dates passed but were never completed. Open one to mark it done if you actually did it, or edit/delete it.</div>`;}
+  if(list.length){h+=list.map(s=>showCard(s)).join('');}
+  else{h+=`<div class="empty"><div class="ei">${tab==='completed'?'✅':tab==='missed'?'⚠️':'🎪'}</div>${tab==='completed'?'No completed shows yet. Shows move here automatically when you close them out.':tab==='missed'?'No missed shows — nice work staying on top of it!':'No upcoming shows. Tap + New Show to start.'}</div>`;}
   h+=`<div style="height:10px"></div>`;
   pg('shows').innerHTML=h;
 }
+// ---- Per-show cost helpers (fall back to old behavior when fields are empty) ----
+function showRoundTrips(sh){ return (sh.roundTrips!=null && sh.roundTrips!=='') ? (parseFloat(sh.roundTrips)||0) : (sh.numDays||1); }
+function showMpg(sh){ return (sh.mpg!=null && sh.mpg!=='') ? (parseFloat(sh.mpg)||0) : (S.settings.mpg||17.5); }
+function showGasPrice(sh){ return (sh.gasPrice!=null && sh.gasPrice!=='') ? (parseFloat(sh.gasPrice)||0) : (S.settings.gasPrice||3.50); }
+function showGas(sh){
+  if(sh.gasOverride!=null && sh.gasOverride!=='') return parseFloat(sh.gasOverride)||0;
+  const mpg=showMpg(sh)||17.5, gp=showGasPrice(sh);
+  return (sh.miles||0)*2*showRoundTrips(sh)/mpg*gp;
+}
+function showMiles(sh){ return (sh.miles||0)*2*showRoundTrips(sh); }
+function showTaxRate(sh){ return (sh.taxRate!=null && sh.taxRate!=='') ? (parseFloat(sh.taxRate)||0) : (S.settings.tax||0.28); }
+// Card/Square sales = taxable base. Counts only card payments (Square + Debit), NOT cash/Venmo/Zelle/etc.
+const CARD_PAY_KEYS=['square','debit'];
+function showCardSales(sh){
+  let t=0;
+  (sh.days||[]).forEach(d=>{ if(d.payments) CARD_PAY_KEYS.forEach(k=>{ t+=parseFloat(d.payments[k])||0; }); });
+  return t;
+}
+function showTaxRes(sh){ return Math.max(0, showCardSales(sh)*showTaxRate(sh)); }
+// ---- Per-show supplies cost: auto lacy bags by bottle size (1 per unit sold) + manual usage ----
+function showAutoSupplyUnits(sh){ const sold=(typeof showUnitsSold==='function')?showUnitsSold(sh):null; const out={}; if(!sold)return out;
+  (S.supplies||[]).forEach(sup=>{ if(sup.autoSizes&&sup.autoSizes.length){ let q=0; sup.autoSizes.forEach(k=>q+=(sold[k]||0)); if(q>0)out[sup.name]=(out[sup.name]||0)+q; } }); return out; }
+// ---- Lace-bag + flat overhead model (bags $0.20; bottle-bundle driven; C5 rides in the polish bag) ----
+function bagUnitCost(){ return (S.settings&&S.settings.bagCost!=null&&S.settings.bagCost!=='')?(parseFloat(S.settings.bagCost)||0):0.20; }
+function candyPerShow(){ return (S.settings&&S.settings.candyPerShow!=null&&S.settings.candyPerShow!=='')?(parseFloat(S.settings.candyPerShow)||0):10; }
+function paperPerShow(){ return (S.settings&&S.settings.paperPerShow!=null&&S.settings.paperPerShow!=='')?(parseFloat(S.settings.paperPerShow)||0):20; }
+function showBagCount(sh){ const u=(typeof showUnitsSold==='function')?showUnitsSold(sh):null; if(!u)return 0;
+  return Math.ceil((u['2oz']||0)/2)+(u['8oz']||0)+(u['16oz']||0)+(u['32oz']||0); }
+function showBagCost(sh){ return showBagCount(sh)*bagUnitCost(); }
+function showFlatOverhead(sh){ return (typeof isMissed==='function'&&isMissed(sh))?0:(candyPerShow()+paperPerShow()); }
+function showSupplyCost(sh){
+  let cost=0; const auto=showAutoSupplyUnits(sh);
+  (S.supplies||[]).forEach(sup=>{ const q=auto[sup.name]||0; if(q>0)cost+=q*(parseFloat(sup.cost)||0); });
+  (sh.supplyUse||[]).forEach(u=>{ const sup=(S.supplies||[]).find(s=>s.name===u.name); const c=sup?(parseFloat(sup.cost)||0):(parseFloat(u.cost)||0); cost+=(parseFloat(u.qty)||0)*c; });
+  cost+=showBagCost(sh)+showFlatOverhead(sh);
+  return cost;
+}
+function showStaffCount(sh){ const reps=(sh.repIds||[]).filter(id=>{const r=(S.reps||[]).find(x=>x.id===id);return r&&r.active&&!r.isSelf;}).length; return reps + (sh.repOnlyShow?0:1); }
+function _hmToMin(t){ if(t==null)return null; t=String(t); if(!/^\d{1,2}:\d{2}$/.test(t))return null; const [h,m]=t.split(':').map(Number); return h*60+m; }
+function _minToHM(mins){ mins=((mins%1440)+1440)%1440; const h=Math.floor(mins/60),m=mins%60; const ap=h<12?'AM':'PM'; let hh=h%12; if(hh===0)hh=12; return hh+(m?(':'+String(m).padStart(2,'0')):'')+' '+ap; }
+function _dayHasTimes(sh,di){ const d=(sh.days||[])[di]; return !!((d&&(d.openTime||d.closeTime))||sh.openTime||sh.closeTime); }
+function dayOpenMin(sh,di){ const d=(sh.days||[])[di]; return _hmToMin(d&&d.openTime) ?? _hmToMin(sh.openTime) ?? 600; }
+function dayCloseMin(sh,di){ const d=(sh.days||[])[di]; return _hmToMin(d&&d.closeTime) ?? _hmToMin(sh.closeTime) ?? 960; }
+function dayCallClose(sh,di){ const o=dayOpenMin(sh,di),c=dayCloseMin(sh,di); return { call:_minToHM(o-60), open:_minToHM(o), close:_minToHM(c) }; }
+function dayWorkHours(sh,di){ if(_dayHasTimes(sh,di)){ const o=dayOpenMin(sh,di),c=dayCloseMin(sh,di); return Math.max(0,(c-o+60)/60); } return parseFloat(sh.hoursPerDay)||8; }
+function showCallClose(sh){ return dayCallClose(sh,0); }
+function showWorkHoursTotal(sh){ const n=(sh.numDays||((sh.days||[]).length)||1); let t=0; for(let i=0;i<n;i++)t+=dayWorkHours(sh,i); return t; }
+function staffedHours(sh){ return showWorkHoursTotal(sh)*showStaffCount(sh); }
+function _bsBlankDay(n,dateStr){ return {dayNum:n,date:dateStr||('Day '+n),morningCount:null,eveningCount:null,payments:{cash:0,square:0,debit:0,venmo:0,zelle:0,cashapp:0,paypal:0},expenses:{gas:0,food:0,parking:0,hotel:0,other:0},repSales:[],notes:'',status:'open'}; }
+function _bsDatesFor(startDate,n){ const out=[]; if(startDate){ const s=new Date(startDate+'T12:00:00'); for(let i=0;i<n;i++){ const d=new Date(s); d.setDate(d.getDate()+i); out.push(d.toLocaleDateString('en-US',{month:'short',day:'numeric'})); } } else { for(let i=0;i<n;i++) out.push('Day '+(i+1)); } return out; }
+function resizeShowDays(sh,newND){
+  sh.days=sh.days||[]; newND=Math.max(1,Math.round(newND)||1);
+  if(newND<sh.days.length){ let lastData=0; sh.days.forEach((d,i)=>{ const hasData=d.morningCount||d.eveningCount||(d.payments&&Object.values(d.payments).some(v=>parseFloat(v)>0)); if(hasData)lastData=i+1; }); newND=Math.max(newND,lastData); }
+  const dates=_bsDatesFor(sh.startDate,newND);
+  if(newND>sh.days.length){ for(let i=sh.days.length;i<newND;i++) sh.days.push(_bsBlankDay(i+1,dates[i])); }
+  else if(newND<sh.days.length){ sh.days=sh.days.slice(0,newND); }
+  sh.days.forEach((d,i)=>{ if(dates[i])d.date=dates[i]; d.dayNum=i+1; });
+  sh.numDays=newND; sh.dates=dates; return newND;
+}
+function showEditCosts(id){
+  const sh=S.shows.find(s=>s.id===id);if(!sh)return;
+  const autoGas=showGas({miles:sh.miles,roundTrips:sh.roundTrips,numDays:sh.numDays});
+  const gpct=Math.round((S.settings.tax||0.28)*100);
+  const esc=v=>(v||'').replace(/"/g,'&quot;');
+  mOpen(`<div class="mh"><div class="mt">✏️ Edit Show</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="padding:8px 0 12px;font-size:13px;color:var(--muted)">Edit anything below, then Save.</div>
+  <div class="fg"><label class="fl">Show Name</label><input class="fi" type="text" id="ec_name" value="${esc(sh.name)}" placeholder="Show name"></div>
+  <div class="fg"><label class="fl">Location</label><input class="fi" type="text" id="ec_loc" value="${esc(sh.location)}" placeholder="City, ST"></div>
+  <div class="fg"><label class="fl">Number of Days</label><input class="fi" type="number" id="ec_days" step="1" min="1" value="${sh.numDays||1}" placeholder="1"></div>
+  <div style="font-size:11px;color:var(--muted);margin:-4px 0 12px">Changing days adds/removes day tabs. Days that already have counts entered are never deleted.</div>
+  <div class="fg"><label class="fl">Booth Cost ($)</label><input class="fi" type="number" id="ec_booth" step="0.01" min="0" value="${sh.boothCost||''}" placeholder="0.00"></div>
+  <div class="fg"><label class="fl">One-Way Miles</label><input class="fi" type="number" id="ec_miles" step="1" min="0" value="${sh.miles||''}" placeholder="0"></div>
+  <div class="fg"><label class="fl">Travel Type — tap one</label>
+    <div style="display:flex;gap:8px">
+      <button type="button" id="ec_tt_daily" class="btn ${(sh.roundTrips===1&&(sh.numDays||1)>1)?'btn-ghost':'btn-gold'} btn-sm" style="flex:1" onclick="ecSetTravel('daily')">🚗 Round-trip daily</button>
+      <button type="button" id="ec_tt_hotel" class="btn ${(sh.roundTrips===1&&(sh.numDays||1)>1)?'btn-gold':'btn-ghost'} btn-sm" style="flex:1" onclick="ecSetTravel('hotel')">🏨 Hotel stay</button>
+    </div>
+  </div>
+  <div class="fg"><label class="fl">Round Trips</label><input class="fi" type="number" id="ec_trips" step="1" min="0" value="${(sh.roundTrips!=null&&sh.roundTrips!=='')?sh.roundTrips:''}" placeholder="${sh.numDays||1} (1 per day)" oninput="ecUpdateTravelPreview()"></div>
+  <div class="g2" style="gap:8px">
+    <div class="fg"><label class="fl">Gas $/gallon (this show)</label><input class="fi" type="number" id="ec_gasprice" step="0.01" min="0" value="${(sh.gasPrice!=null&&sh.gasPrice!=='')?sh.gasPrice:''}" placeholder="${(S.settings.gasPrice||3.5).toFixed(2)}" oninput="ecUpdateTravelPreview()"></div>
+    <div class="fg"><label class="fl">MPG (this vehicle)</label><input class="fi" type="number" id="ec_mpg" step="0.1" min="0" value="${(sh.mpg!=null&&sh.mpg!=='')?sh.mpg:''}" placeholder="${S.settings.mpg||17.5}" oninput="ecUpdateTravelPreview()"></div>
+  </div>
+  <div id="ec_travel_preview" style="font-size:12px;color:var(--gold);margin:-2px 0 10px;font-weight:700"></div>
+  <div style="font-size:11px;color:var(--muted);margin:-2px 0 12px">🚗 Round-trip daily = drive home each night (trips = # days). 🏨 Hotel = there once & back once (1 trip). Leave gas $/gal & MPG blank to use Settings.</div>
+  <div class="fg"><label class="fl">Actual Gas $ — optional, overrides the estimate</label><input class="fi" type="number" id="ec_gas" step="0.01" min="0" value="${(sh.gasOverride!=null&&sh.gasOverride!=='')?sh.gasOverride:''}" placeholder="auto: ${fmt(autoGas)}"></div>
+  <div class="fg"><label class="fl">Lodging / Hotel ($)</label><input class="fi" type="number" id="ec_lodging" step="0.01" min="0" value="${sh.lodging||''}" placeholder="0.00"></div>
+  <div class="fg"><label class="fl">Hours — set each day's open &amp; close</label>
+    ${Array.from({length:sh.numDays||1},(_,i)=>{
+      const d=(sh.days||[])[i]||{}; const dl=(sh.dates&&sh.dates[i])?sh.dates[i]:('Day '+(i+1));
+      const o=(d.openTime||sh.openTime||'10:00'), c=(d.closeTime||sh.closeTime||'16:00');
+      return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><div style="min-width:62px;font-size:12px;color:var(--muted)">${dl}</div><input class="fi" type="time" id="ec_open_${i}" value="${o}" style="flex:1"><span style="color:var(--muted);font-size:12px">to</span><input class="fi" type="time" id="ec_close_${i}" value="${c}" style="flex:1"></div>`;
+    }).join('')}
+  </div>
+  <div style="font-size:11px;color:var(--muted);margin:-2px 0 12px">Call time = 1 hour before open. Different each day is fine.</div>
+  <div class="fg"><label class="fl">Tax % for this show</label><input class="fi" type="number" id="ec_tax" step="0.1" min="0" max="100" value="${(sh.taxRate!=null&&sh.taxRate!=='')?(sh.taxRate*100):''}" placeholder="${gpct} (global default)"></div>
+  <div style="font-size:11px;color:var(--muted);margin:-4px 0 14px">Leave tax blank to use the global ${gpct}%. Set 0 for a tax-free show/state.</div>
+  <div class="fg"><label class="fl">👥 Crew — hours worked &amp; what you paid</label>
+    ${(()=>{
+      const ids=[...(sh.repIds||[])]; const owner=(S.reps||[]).find(r=>r.isSelf);
+      if(owner&&!sh.repOnlyShow&&!ids.includes(owner.id))ids.unshift(owner.id);
+      (sh.repPayout?Object.keys(sh.repPayout):[]).forEach(k=>{if(!ids.includes(k))ids.push(k);});
+      if(!ids.length)return '<div style="font-size:12px;color:var(--muted)">No reps assigned yet — assign reps on the show first, then set hours here.</div>';
+      return ids.map(rid=>{ const r=(S.reps||[]).find(x=>x.id===rid); if(!r)return '';
+        const hrs=(sh.repHours&&sh.repHours[rid]!=null)?sh.repHours[rid]:(r.isSelf&&sh.myHours!=null?sh.myHours:'');
+        const paid=(sh.repPayout&&sh.repPayout[rid]!=null)?sh.repPayout[rid]:'';
+        const autoC=repShowCalcComm(sh,rid);
+        return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><div style="min-width:74px;font-size:12px;font-weight:700">${r.name}${r.isSelf?' 👑':''}</div>
+          <input class="fi" type="number" step="0.5" min="0" id="ec_hrs_${rid}" value="${hrs}" placeholder="hrs" style="flex:1">
+          ${r.isSelf?'<div style="flex:1;font-size:11px;color:var(--muted);text-align:center">earns profit</div>':`<input class="fi" type="number" step="0.01" min="0" id="ec_paid_${rid}" value="${paid}" placeholder="paid ${autoC?fmt(autoC):'0'}" style="flex:1">`}</div>`;
+      }).join('');
+    })()}
+  </div>
+  <div style="font-size:11px;color:var(--muted);margin:-2px 0 12px">"Paid" replaces the auto commission for that rep this show (blank = use auto). The show detail then shows each person's $/hour.</div>
+  <div class="fg"><label class="fl">Show notes</label><textarea class="fi" id="ec_notes" placeholder="Anything to remember about this show…">${(sh.notes||'').replace(/</g,'&lt;')}</textarea></div>
+  <button class="btn btn-gold btn-full" onclick="saveEditCosts('${id}')">Save Costs</button>`);
+  setTimeout(ecUpdateTravelPreview,40);
+}
+function ecSetTravel(mode){
+  const days=parseInt(($$('ec_days')||{}).value)||1;
+  if($$('ec_trips'))$$('ec_trips').value=(mode==='hotel')?1:days;
+  const b1=$$('ec_tt_daily'),b2=$$('ec_tt_hotel');
+  if(b1){b1.classList.toggle('btn-gold',mode!=='hotel');b1.classList.toggle('btn-ghost',mode==='hotel');}
+  if(b2){b2.classList.toggle('btn-gold',mode==='hotel');b2.classList.toggle('btn-ghost',mode!=='hotel');}
+  ecUpdateTravelPreview();
+}
+function ecUpdateTravelPreview(){
+  const el=$$('ec_travel_preview'); if(!el)return;
+  const miles=parseFloat(($$('ec_miles')||{}).value)||0;
+  const trips=parseFloat(($$('ec_trips')||{}).value)|| (parseInt(($$('ec_days')||{}).value)||1);
+  const mpg=parseFloat(($$('ec_mpg')||{}).value)||(S.settings.mpg||17.5);
+  const gp=parseFloat(($$('ec_gasprice')||{}).value)||(S.settings.gasPrice||3.5);
+  const totMiles=miles*2*trips; const gas=mpg>0?totMiles/mpg*gp:0;
+  el.textContent='Total miles: '+Math.round(totMiles)+' · est. gas: '+fmt(gas);
+}
+function saveEditCosts(id){
+  const sh=S.shows.find(s=>s.id===id);if(!sh)return;
+  const v=k=>{const el=$$(k);return el?(el.value||'').trim():'';};
+  const nm=v('ec_name'); if(nm)sh.name=nm;
+  sh.location=v('ec_loc');
+  const ndRaw=v('ec_days'); if(ndRaw!==''){ const nd=Math.max(1,parseInt(ndRaw,10)||1); if(nd!==sh.numDays) resizeShowDays(sh,nd); }
+  sh.boothCost=parseFloat(v('ec_booth'))||0;
+  sh.miles=parseFloat(v('ec_miles'))||0;
+  const tr=v('ec_trips'); sh.roundTrips = tr===''?null:(parseFloat(tr)||0);
+  const gpr=v('ec_gasprice'); sh.gasPrice = gpr===''?null:(parseFloat(gpr)||0);
+  const mpgv=v('ec_mpg'); sh.mpg = mpgv===''?null:(parseFloat(mpgv)||0);
+  const g=v('ec_gas'); sh.gasOverride = g===''?null:(parseFloat(g)||0);
+  sh.lodging=parseFloat(v('ec_lodging'))||0;
+  for(let i=0; $$('ec_open_'+i); i++){ const o=v('ec_open_'+i), c=v('ec_close_'+i); if(sh.days&&sh.days[i]){ sh.days[i].openTime=o||null; sh.days[i].closeTime=c||null; } }
+  if(sh.days&&sh.days[0]){ sh.openTime=sh.days[0].openTime||null; sh.closeTime=sh.days[0].closeTime||null; }
+  const tx=v('ec_tax'); sh.taxRate = tx===''?null:((parseFloat(tx)||0)/100);
+  if(!sh.repHours)sh.repHours={};
+  const _crew=[...new Set([...((S.reps||[]).filter(r=>r.isSelf).map(r=>r.id)), ...(sh.repIds||[]), ...Object.keys(sh.repPayout||{})])];
+  _crew.forEach(rid=>{
+    const hEl=$$('ec_hrs_'+rid); if(hEl){ const hv=(hEl.value||'').trim(); if(hv==='')delete sh.repHours[rid]; else sh.repHours[rid]=parseFloat(hv)||0; }
+    const pEl=$$('ec_paid_'+rid); if(pEl){ const pv=(pEl.value||'').trim(); if(!sh.repPayout)sh.repPayout={}; if(pv==='')delete sh.repPayout[rid]; else sh.repPayout[rid]=parseFloat(pv)||0; }
+  });
+  const _own=(S.reps||[]).find(r=>r.isSelf); if(_own&&sh.repHours[_own.id]!=null)sh.myHours=sh.repHours[_own.id];
+  sh.notes=v('ec_notes');
+  saveS();mClose();toast('Show saved!');renderCur();
+}
 function calcBreakEven(sh){
-  const mpg=S.settings.mpg||17.5;
-  const gp=S.settings.gasPrice||3.50;
-  const gas=(sh.miles||0)*2*(sh.numDays||1)/mpg*gp;
+  const gas=showGas(sh);
   const showExp=(sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
-  return (sh.boothCost||0)+gas+(sh.lodging||0)+showExp;
+  const flatOverhead=(typeof showFlatOverhead==='function')?showFlatOverhead(sh):0; // candy + paper towels
+  const fixedCosts=(sh.boothCost||0)+gas+(sh.lodging||0)+showExp+flatOverhead;
+  // Need enough SALES that, after product cost (COGS) and rep commission, fixed costs are covered:
+  // BE = fixedCosts / (1 - cogsRate - blendedCommRate)
+  const paidRepList=(sh.repIds||[]).map(id=>(S.reps||[]).find(x=>x.id===id)).filter(r=>r&&!r.isSelf&&r.active);
+  const cogsRate=0.30;
+  if(paidRepList.length){
+    const blendedCommRate=paidRepList.reduce((t,r)=>{const rt=repCommRates(r);return t+(0.60*rt.cash+0.40*rt.card);},0)/paidRepList.length;
+    const variableRate=cogsRate+blendedCommRate;
+    return variableRate>=1?fixedCosts*3:fixedCosts/(1-variableRate);
+  }
+  return fixedCosts/(1-cogsRate);
 }
 const SHOW_EXP_CATS=[
   {key:'fuel',   label:'Fuel',         icon:'⛽'},
@@ -911,26 +1144,44 @@ const SHOW_EXP_CATS=[
 ];
 function showCard(sh){
   const t=calcShow(sh);
-  const cls=sh.status==='active'?'sa':sh.status==='completed'?'sd':'';
-  const bdg=sh.status==='active'?'🔴 ACTIVE':sh.status==='completed'?'✅ DONE':'📅 PLANNED';
+  const missed=isMissed(sh);
+  const cls=missed?'sd':(sh.status==='active'?'sa':sh.status==='completed'?'sd':'');
+  const bdg=missed?'❌ MISSED / DID NOT DO':(sh.status==='active'?'🔴 ACTIVE':sh.status==='completed'?'✅ DONE':'📅 PLANNED');
   const dateStr=sh.dates?sh.dates.join(' → '):'';
+  const dateBig=(sh.dates&&sh.dates.length)?(sh.dates.length>1?sh.dates[0]+' – '+sh.dates[sh.dates.length-1]:sh.dates[0]):(sh.startDate||'Date TBD');
   const be=calcBreakEven(sh);
   const beHit=sh.status==='completed'&&t.gross>=be;
   return`<div class="sc ${cls}" onclick="go('show','${sh.id}',0)">
-    <span class="sc-badge ${sh.status}">${bdg}</span>
+    <span class="sc-badge ${sh.status}"${missed?' style="background:var(--redbg);color:var(--red);border:1px solid var(--redbd)"':''}>${bdg}</span>
     <div class="sc-name">${sh.name}</div>
-    <div class="sc-loc">${sh.location?sh.location+' · ':''}${dateStr}${sh.numDays>1?' · '+sh.numDays+' days':''}</div>
-    ${sh.status==='planned'?`
+    <div style="font-size:21px;font-weight:900;color:var(--gold);letter-spacing:.3px;margin:3px 0 4px;line-height:1.15">📅 ${dateBig}${sh.numDays>1?` · ${sh.numDays} days`:''}</div>
+    <div class="sc-loc">${sh.location||''}</div>
+    ${missed?`<div style="margin-top:8px;padding:8px;background:var(--redbg);border:1px solid var(--redbd);border-radius:6px" onclick="event.stopPropagation()">
+      <div style="font-size:9px;color:var(--red);text-transform:uppercase;font-weight:700;margin-bottom:3px">❌ Why missed?</div>
+      <textarea class="fi" style="font-size:12px;min-height:38px" placeholder="e.g. double-booked; weather; booth fell through" onchange="saveMissedReason('${sh.id}',this.value)">${(sh.missedReason||'').replace(/</g,'&lt;')}</textarea>
+    </div>`:''}
+    ${(sh.status==='planned'&&!missed)?`
     <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center;padding:6px 8px;background:rgba(255,200,0,0.08);border-radius:6px;border:1px solid rgba(255,200,0,0.2)">
       <div style="font-size:11px;color:var(--muted)">${sh.numDays||1} day${sh.numDays>1?'s':''} · ${sh.miles||0} mi · Booth ${sh.boothCost?fmt(sh.boothCost):'TBD'}</div>
       <div style="text-align:right"><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Break Even</div><div style="font-size:16px;font-weight:900;color:var(--gold)">${fmt(be)}</div></div>
-    </div>`:``}
+    </div>
+    ${(()=>{
+      const dlabels=(sh.dates&&sh.dates.length)?sh.dates:Array.from({length:sh.numDays||1},(_,i)=>'Day '+(i+1));
+      const sched=dlabels.map((dl,i)=>{const ct=dayCallClose(sh,i);return `<div style="display:flex;justify-content:space-between;font-size:11px;padding:2px 0"><span style="color:var(--muted)">${dl}</span><span style="font-weight:700">${ct.call} – ${ct.close}</span></div>`;}).join('');
+      const repNames=(sh.repIds||[]).map(id=>{const r=(S.reps||[]).find(x=>x.id===id);return r?r.name+(r.isSelf?' 👑':''):null;}).filter(Boolean);
+      return `<div style="margin-top:6px;padding:8px;background:rgba(120,130,160,0.08);border-radius:6px">
+        <div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:3px">⏰ Schedule · call = 1 hr before open</div>
+        ${sched}
+        <div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700;margin:6px 0 3px">👥 Reps scheduled</div>
+        <div style="font-size:12px;font-weight:700">${repNames.length?repNames.join(', '):'<span style="color:var(--muted);font-weight:400">None yet — tap the show to assign</span>'}</div>
+      </div>`;
+    })()}`:``}
     ${sh.status==='active'?`
     <div class="sc-stats">
       <div class="sc-s"><div class="sv2">${fmt(t.gross)}</div><div class="sl2">Gross</div></div>
       <div class="sc-s"><div class="sv2">${fmt(t.cogs)}</div><div class="sl2">COGS</div></div>
       <div class="sc-s"><div class="sv2">${fmt(t.expenses)}</div><div class="sl2">Exp</div></div>
-      <div class="sc-s"><div class="sv2" style="color:${t.profit>=0?'var(--green)':'var(--red)}'}">${fmt(t.profit)}</div><div class="sl2">Profit</div></div>
+      <div class="sc-s"><div class="sv2" style="color:${t.profit>=0?'var(--green)':'var(--red)'}">${fmt(t.profit)}</div><div class="sl2">Profit</div></div>
     </div>
     <div style="margin-top:6px;padding:5px 8px;background:rgba(255,200,0,0.08);border-radius:5px;display:flex;justify-content:space-between;font-size:11px">
       <span style="color:var(--muted)">Break Even: <b style="color:var(--gold)">${fmt(be)}</b></span>
@@ -941,13 +1192,16 @@ function showCard(sh){
       <div class="sc-s"><div class="sv2">${fmt(t.gross)}</div><div class="sl2">Gross</div></div>
       <div class="sc-s"><div class="sv2">${fmt(t.cogs)}</div><div class="sl2">COGS</div></div>
       <div class="sc-s"><div class="sv2">${fmt(t.expenses)}</div><div class="sl2">Exp</div></div>
-      <div class="sc-s"><div class="sv2" style="color:${t.profit>=0?'var(--green)':'var(--red)}'}">${fmt(t.profit)}</div><div class="sl2">Profit</div></div>
+      <div class="sc-s"><div class="sv2" style="color:${t.profit>=0?'var(--green)':'var(--red)'}">${fmt(t.profit)}</div><div class="sl2">Profit</div></div>
     </div>
     <div style="margin-top:6px;padding:5px 8px;background:${beHit?'rgba(0,200,100,0.08)':'rgba(255,60,60,0.08)'};border-radius:5px;display:flex;justify-content:space-between;font-size:11px">
       <span style="color:var(--muted)">Break Even: <b style="color:var(--gold)">${fmt(be)}</b></span>
       <span style="color:${beHit?'var(--green)':'var(--red)'};font-weight:700">${beHit?'✅ HIT — '+fmt(t.gross-be)+' over':'❌ MISSED by '+fmt(be-t.gross)}</span>
     </div>`:``}
-    <div style="margin-top:8px;display:flex;gap:6px" onclick="event.stopPropagation()">
+    <div style="margin-top:8px" onclick="event.stopPropagation()">
+      <button style="width:100%;font-size:11px;padding:6px 8px;background:rgba(255,215,0,0.14);border:1px solid var(--goldbd);color:var(--gold);border-radius:6px;cursor:pointer;font-weight:800" onclick="showEditCosts('${sh.id}')">✏️ Edit Show — name · days · costs · tax</button>
+    </div>
+    <div style="margin-top:6px;display:flex;gap:6px" onclick="event.stopPropagation()">
       <button style="flex:1;font-size:11px;padding:5px 8px;background:rgba(100,149,237,0.12);border:1px solid rgba(100,149,237,0.3);color:#7EB8F7;border-radius:6px;cursor:pointer;font-weight:700" onclick="showLodgingModal('${sh.id}')">${sh.lodging?'🏨 '+fmt(sh.lodging):'🏨 Lodging'}</button>
       <button style="flex:1;font-size:11px;padding:5px 8px;background:${(sh.showExpenses||[]).length?'rgba(255,165,0,0.15)':'rgba(255,165,0,0.07)'};border:1px solid rgba(255,165,0,0.3);color:#FFA500;border-radius:6px;cursor:pointer;font-weight:700" onclick="showShowExpModal('${sh.id}')">${(sh.showExpenses||[]).length?'💸 Exp: '+fmt((sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0)):'💸 Other Expenses'}</button>
     </div>
@@ -965,6 +1219,11 @@ function saveLodging(id){
   const sh=S.shows.find(s=>s.id===id);if(!sh)return;
   sh.lodging=parseFloat($$('lod_amt').value)||0;
   saveS();mClose();toast('Lodging saved!');rShows();
+}
+function saveMissedReason(id,val){
+  const sh=S.shows.find(s=>s.id===id);if(!sh)return;
+  sh.missedReason=(val||'').trim();
+  saveS();
 }
 
 // ===================================================
@@ -1034,7 +1293,7 @@ function rPnL(){
   const y=new Date().getFullYear();
   const ytd=calcYTD();
   const tax=S.settings.tax||0.28;
-  const taxAmt=Math.max(0,ytd.profit*tax);
+  const taxAmt=ytd.taxRes; // card/Square sales × per-show tax rate (cash excluded)
   const keep=Math.max(0,ytd.profit-taxAmt);
   const qtr=taxAmt/4;
   let boothTotal=0,showExpTotal=0,dayExpTotal=0,lodgingTotal=0;
@@ -1069,7 +1328,7 @@ function rPnL(){
     <div class="sr" style="border-bottom:none"><span class="srl">Supply Purchases</span><span class="srv red">-${fmt(globalSupply)}</span></div>
   </div>`;
   h+=`<div class="card rb" style="margin-bottom:12px">
-    <div style="font-size:10px;color:var(--red);text-transform:uppercase;font-weight:700;margin-bottom:10px">🧾 TAX RESERVE (${Math.round(tax*100)}%)</div>
+    <div style="font-size:10px;color:var(--red);text-transform:uppercase;font-weight:700;margin-bottom:10px">🧾 TAX RESERVE (${Math.round(tax*100)}% of card/Square sales)</div>
     <div class="g2" style="gap:8px;margin-bottom:10px">
       <div class="sbox rb"><div class="sl">Set Aside Now</div><div class="sv r">${fmt(taxAmt)}</div></div>
       <div class="sbox grb"><div class="sl">Keep (${100-Math.round(tax*100)}%)</div><div class="sv g">${fmt(keep)}</div></div>
@@ -1139,6 +1398,356 @@ function createShow(){
 }
 
 // ===================================================
+// DISCOUNTS / FREEBIES (Change 2) — a log + summary only.
+// Never touches sold counts, payments, or revenue math.
+// ===================================================
+function openDiscountModal(shId){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
+  const today=new Date().toISOString().split('T')[0];
+  mOpen(`<div class="mh"><div class="mt">🏷️ Log Discount / Freebie</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Money you gave up — a discount, a free bottle, a promo, a damaged unit. Tracked separately; does NOT change unit counts or sales.</div>
+  <div class="fg"><label class="fl">Amount Given Up ($)</label><input class="fi" type="number" id="disc_amt" placeholder="0.00" step="0.01" min="0" inputmode="decimal"></div>
+  <div class="fg"><label class="fl">Notes (what & why)</label><input class="fi" id="disc_note" placeholder="e.g. 2 free 2oz to the vendor next door"></div>
+  <div class="fg"><label class="fl">Date</label><input class="fi" type="date" id="disc_date" value="${today}"></div>
+  <button class="btn btn-gold btn-full" onclick="saveDiscount('${shId}')">✅ Save</button>`);
+}
+function saveDiscount(shId){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
+  const amt=parseFloat($$('disc_amt').value);
+  if(!amt||amt<=0){toast('Enter an amount');return;}
+  if(!sh.discounts)sh.discounts=[];
+  sh.discounts.push({id:'disc_'+Date.now(),amount:amt,note:($$('disc_note').value||'').trim(),date:$$('disc_date').value||new Date().toISOString().split('T')[0],ts:new Date().toISOString()});
+  mClose();saveS();toast('🏷️ Discount logged — '+fmt(amt));
+}
+function delDiscount(shId,id){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh||!sh.discounts)return;
+  if(!confirm('Remove this discount entry?'))return;
+  sh.discounts=sh.discounts.filter(x=>x.id!==id);
+  saveS();toast('Removed');
+}
+
+// ===================================================
+// INVENTORY TRANSFERS (Change 1) — move packed stock between shows.
+// NOT a sale; never touches day counts, payments, revenue, or units-sold.
+// ===================================================
+function transferableShows(){ return (S.shows||[]).filter(s=>s.status==='active'||s.status==='planned'); }
+function openTransferModal(presetFromId){
+  const shows=transferableShows();
+  if(shows.length<2){ toast('Need 2+ active/planned shows to transfer between'); return; }
+  const from=presetFromId&&shows.find(s=>s.id===presetFromId)?presetFromId:shows[0].id;
+  const toDefault=(shows.find(s=>s.id!==from)||{}).id;
+  const opt=(sel)=>shows.map(s=>`<option value="${s.id}"${s.id===sel?' selected':''}>${s.name}${s.status==='active'?' 🔴':''}</option>`).join('');
+  mOpen(`<div class="mh"><div class="mt">🔄 Transfer Stock Between Shows</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Moves packed units from one show to another (e.g. one booth ran out). This is NOT a sale — revenue, units sold, and rep totals are untouched.</div>
+  <div class="fg"><label class="fl">Product</label><select class="fi" id="tr_sku">${SKUS.map(s=>`<option value="${s.key}">${s.name}</option>`).join('')}</select></div>
+  <div class="fg"><label class="fl">Quantity</label><input class="fi" type="number" id="tr_qty" placeholder="0" min="1" step="1" inputmode="numeric"></div>
+  <div class="fg"><label class="fl">From Show</label><select class="fi" id="tr_from">${opt(from)}</select></div>
+  <div class="fg"><label class="fl">To Show</label><select class="fi" id="tr_to">${opt(toDefault)}</select></div>
+  <button class="btn btn-gold btn-full" onclick="saveTransfer()">✅ Transfer</button>`);
+}
+function saveTransfer(){
+  const sku=$$('tr_sku').value, qty=parseInt($$('tr_qty').value)||0;
+  const fromId=$$('tr_from').value, toId=$$('tr_to').value;
+  if(qty<=0){toast('Enter a quantity');return;}
+  if(fromId===toId){toast('Pick two different shows');return;}
+  const from=S.shows.find(s=>s.id===fromId), to=S.shows.find(s=>s.id===toId);
+  if(!from||!to){toast('Show not found');return;}
+  from.packedInventory=from.packedInventory||{}; to.packedInventory=to.packedInventory||{};
+  const avail=from.packedInventory[sku]||0;
+  if(qty>avail&&!confirm(`${from.name} only shows ${avail} packed. Transfer anyway?`))return;
+  from.packedInventory[sku]=(from.packedInventory[sku]||0)-qty;
+  to.packedInventory[sku]=(to.packedInventory[sku]||0)+qty;
+  if(!S.transfers)S.transfers=[];
+  S.transfers.push({id:'tr_'+Date.now(),ts:new Date().toISOString(),date:new Date().toISOString().split('T')[0],sku,qty,fromShowId:fromId,fromName:from.name,toShowId:toId,toName:to.name});
+  mClose();saveS();
+  const sName=(SKUS.find(s=>s.key===sku)||{}).short||sku;
+  toast(`🔄 Moved ${qty} ${sName}: ${from.name} → ${to.name}`);
+}
+function delTransfer(id){
+  if(!S.transfers)return;
+  const tr=S.transfers.find(x=>x.id===id);if(!tr)return;
+  if(!confirm('Undo this transfer? Units move back from '+tr.toName+' to '+tr.fromName+'.'))return;
+  const from=S.shows.find(s=>s.id===tr.fromShowId), to=S.shows.find(s=>s.id===tr.toShowId);
+  if(from){from.packedInventory=from.packedInventory||{};from.packedInventory[tr.sku]=(from.packedInventory[tr.sku]||0)+tr.qty;}
+  if(to){to.packedInventory=to.packedInventory||{};to.packedInventory[tr.sku]=(to.packedInventory[tr.sku]||0)-tr.qty;}
+  S.transfers=S.transfers.filter(x=>x.id!==id);
+  saveS();toast('Transfer undone');
+}
+
+// ===================================================
+// REPS & COMMISSIONS (ported from main app)
+// Cash = 35%; card + all electronic = 30%. Owner (isSelf) earns nothing.
+// ===================================================
+function _emptyRS(repId){ const o={repId}; PMTS.forEach(p=>o[p.key]=0); return o; }
+function repCommRates(rep){ return {
+  cash:(rep&&rep.commCash!=null&&rep.commCash!=='')?(parseFloat(rep.commCash)||0):COMM_CASH,
+  card:(rep&&rep.commCard!=null&&rep.commCard!=='')?(parseFloat(rep.commCard)||0):COMM_CARD }; }
+function calcRepSalesComm(rs){
+  const rep=(S.reps||[]).find(r=>r.id===rs.repId);
+  if(!rep||rep.isSelf)return 0;
+  const rt=repCommRates(rep);
+  let cashAmt=0,cardElecAmt=0;
+  PMTS.forEach(p=>{const v=parseFloat(rs[p.key])||0; if(CASH_COMM_KEYS.includes(p.key))cashAmt+=v; else cardElecAmt+=v;});
+  return cashAmt*rt.cash+cardElecAmt*rt.card;
+}
+function calcDayComm(day){ return (day.repSales||[]).reduce((t,rs)=>t+calcRepSalesComm(rs),0); }
+function repShowCalcComm(sh,repId){ let t=0; (sh.days||[]).forEach(d=>(d.repSales||[]).forEach(rs=>{ if(rs.repId===repId)t+=calcRepSalesComm(rs); })); return t; }
+function repShowComm(sh,repId){ const ov=sh.repPayout&&sh.repPayout[repId]; if(ov!=null&&ov!=='')return parseFloat(ov)||0; return repShowCalcComm(sh,repId); }
+function showRepIds(sh){ const ids=new Set(); (sh.days||[]).forEach(d=>(d.repSales||[]).forEach(rs=>{ if(rs.repId)ids.add(rs.repId); })); if(sh.repPayout)Object.keys(sh.repPayout).forEach(k=>ids.add(k)); return [...ids]; }
+function calcShowComm(sh){ return showRepIds(sh).reduce((t,repId)=>t+repShowComm(sh,repId),0); }
+function repShowSales(sh,repId){ let t=0; (sh.days||[]).forEach(d=>(d.repSales||[]).forEach(rs=>{ if(rs.repId===repId)t+=PMTS.reduce((a,p)=>a+(parseFloat(rs[p.key])||0),0); })); return t; }
+function repDayCalcComm(d,repId){ let t=0; (d.repSales||[]).forEach(rs=>{ if(rs.repId===repId)t+=calcRepSalesComm(rs); }); return t; }
+function dayCommEffective(sh,di){
+  const d=(sh.days||[])[di]; if(!d)return 0; let total=0;
+  showRepIds(sh).forEach(repId=>{
+    const eff=repShowComm(sh,repId); if(!eff)return;
+    const calcTot=repShowCalcComm(sh,repId);
+    if(calcTot>0){ total+=eff*(repDayCalcComm(d,repId)/calcTot); return; }
+    const days=(sh.days||[]);
+    const selling=days.filter(x=>(x.repSales||[]).some(rs=>rs.repId===repId&&PMTS.some(p=>(parseFloat(rs[p.key])||0)>0)));
+    const pool=selling.length?selling:days;
+    if(pool.indexOf(d)>=0)total+=eff/pool.length;
+  });
+  return total;
+}
+function repEarned(repId,shId){ let total=0; (S.shows||[]).forEach(sh=>{ if(shId&&sh.id!==shId)return; total+=repShowComm(sh,repId); }); return total; }
+function repPaid(repId,shId){ const rep=(S.reps||[]).find(r=>r.id===repId);if(!rep)return 0; return (rep.payments||[]).filter(p=>!shId||p.showId===shId).reduce((t,p)=>t+(parseFloat(p.amount)||0),0); }
+function repOwed(repId,shId){ return Math.max(0,repEarned(repId,shId)-repPaid(repId,shId)); }
+function allRepsOwed(){ return (S.reps||[]).filter(r=>!r.isSelf&&r.active).map(r=>({rep:r,earned:repEarned(r.id),paid:repPaid(r.id),owed:repOwed(r.id)})).filter(x=>x.earned>0||x.owed>0); }
+
+function openAddRep(){
+  mOpen(`<div class="mh"><div class="mt">👤 Add Rep</div><button class="mx" onclick="mClose()">×</button></div>
+  <div class="fg"><label class="fl">Name</label><input class="fi" id="ar_name" placeholder="e.g. Batnizzle"></div>
+  <div class="fg"><label class="fl">Phone (optional)</label><input class="fi" id="ar_phone" type="tel" placeholder="414-555-0100"></div>
+  <button class="btn btn-gold btn-full" onclick="saveNewRep()">Add Rep</button>`);
+}
+function saveNewRep(){
+  const name=($$('ar_name').value||'').trim(); if(!name){toast('Enter a name');return;}
+  if(!S.reps)S.reps=[];
+  const id='rep_'+name.toLowerCase().replace(/[^a-z0-9]/g,'')+'_'+Date.now();
+  S.reps.push({id,name,phone:($$('ar_phone').value||'').trim(),isSelf:false,active:true,payments:[]});
+  mClose();saveS();toast('✅ '+name+' added!');rSettings();
+}
+function openEditRep(repId){
+  const rep=(S.reps||[]).find(r=>r.id===repId);if(!rep)return;
+  mOpen(`<div class="mh"><div class="mt">✏️ Edit Rep</div><button class="mx" onclick="mClose()">×</button></div>
+  <div class="fg"><label class="fl">Name</label><input class="fi" id="er_name" value="${rep.name}"></div>
+  <div class="fg"><label class="fl">Phone</label><input class="fi" id="er_phone" value="${rep.phone||''}"></div>
+  <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="er_active" ${rep.active?'checked':''} style="width:18px;height:18px"><span>Active (appears in show rosters)</span></label></div>
+  <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="er_self" ${rep.isSelf?'checked':''} style="width:18px;height:18px"><span>This is ME (owner — earns no commission)</span></label></div>
+  ${!rep.isSelf?`<div class="fg"><label class="fl">Commission rates — blank = default (${Math.round(COMM_CASH*100)}% cash / ${Math.round(COMM_CARD*100)}% card/electronic)</label>
+    <div class="g2" style="gap:8px">
+      <div><label class="fl" style="font-size:10px">CASH %</label><input class="fi" type="number" id="er_commcash" step="1" min="0" max="100" value="${(rep.commCash!=null&&rep.commCash!=='')?Math.round(rep.commCash*100):''}" placeholder="${Math.round(COMM_CASH*100)}"></div>
+      <div><label class="fl" style="font-size:10px">CARD/ELECTRONIC %</label><input class="fi" type="number" id="er_commcard" step="1" min="0" max="100" value="${(rep.commCard!=null&&rep.commCard!=='')?Math.round(rep.commCard*100):''}" placeholder="${Math.round(COMM_CARD*100)}"></div>
+    </div>
+  </div>
+  <button type="button" class="btn btn-ghost btn-sm btn-full" style="margin:-4px 0 12px" onclick="var c=prompt('Flat commission % — applies to BOTH cash and card','40');if(c!==null&&c!==''){$$('er_commcash').value=c;$$('er_commcard').value=c;}">⚡ Set one flat rate (e.g. 40% both)</button>`:''}
+  ${(()=>{ const earned=repEarned(repId);const paid=repPaid(repId);const owed=Math.max(0,earned-paid); if(!earned)return''; return`<div style="background:var(--card2);border-radius:8px;padding:10px;margin-bottom:12px;font-size:12px"><div style="font-weight:700;margin-bottom:4px">Season Stats</div><div>Earned: <span style="color:var(--red)">${fmt(earned)}</span> · Paid: <span style="color:var(--green)">${fmt(paid)}</span>${owed>0?` · <span style="color:var(--gold);font-weight:800">Owes ${fmt(owed)}</span>`:' ✓'}</div></div>`; })()}
+  <button class="btn btn-gold btn-full" style="margin-bottom:8px" onclick="saveEditRep('${repId}')">Save Changes</button>
+  ${!rep.isSelf?`<button class="btn btn-ghost btn-full" onclick="mClose();openLogRepPmt('${repId}')">💰 Log Payment to ${rep.name}</button>`:''}`);
+}
+function saveEditRep(repId){
+  const rep=(S.reps||[]).find(r=>r.id===repId);if(!rep)return;
+  rep.name=($$('er_name').value||rep.name).trim();
+  rep.phone=($$('er_phone').value||'').trim();
+  rep.active=$$('er_active').checked;
+  if($$('er_self'))rep.isSelf=$$('er_self').checked;
+  if(!rep.isSelf){
+    const cc=($$('er_commcash')||{}).value; rep.commCash=(cc==null||cc==='')?null:((parseFloat(cc)||0)/100);
+    const cd=($$('er_commcard')||{}).value; rep.commCard=(cd==null||cd==='')?null:((parseFloat(cd)||0)/100);
+  }
+  mClose();saveS();toast('✅ Saved!');rSettings();
+}
+function openEditPayout(shId,repId){
+  const sh=S.shows.find(s=>s.id===shId);const rep=(S.reps||[]).find(r=>r.id===repId);
+  if(!sh||!rep)return;
+  const auto=repShowCalcComm(sh,repId);
+  const ov=sh.repPayout&&sh.repPayout[repId];
+  const cur=(ov!=null&&ov!=='')?ov:'';
+  mOpen(`<div class="mh"><div class="mt">💵 Payout — ${rep.name}</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:10px">${sh.name}</div>
+  <div style="background:var(--card2);border-radius:8px;padding:10px;margin-bottom:12px;font-size:12px">
+    Auto-calculated commission: <strong style="color:var(--gold)">${fmt(auto)}</strong><br>
+    <span style="color:var(--muted)">Enter the actual amount you paid (covers commission + anything extra). It replaces the calculated number for this show.</span>
+  </div>
+  <div class="fg"><label class="fl">Actual payout for this show ($)</label><input class="fi" type="number" id="ep_amt" step="0.01" min="0" value="${cur}" placeholder="${auto.toFixed(2)}"></div>
+  <button class="btn btn-gold btn-full" style="margin-bottom:8px" onclick="saveEditPayout('${shId}','${repId}')">Save Payout</button>
+  ${(ov!=null&&ov!=='')?`<button class="btn btn-ghost btn-full" onclick="clearEditPayout('${shId}','${repId}')">↩︎ Clear override (use auto ${fmt(auto)})</button>`:''}`);
+}
+function saveEditPayout(shId,repId){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
+  const raw=($$('ep_amt')||{}).value;
+  if(raw==null||raw===''){ clearEditPayout(shId,repId); return; }
+  if(!sh.repPayout)sh.repPayout={};
+  sh.repPayout[repId]=parseFloat(raw)||0;
+  mClose();saveS();toast('✅ Payout set');renderCur();
+}
+function clearEditPayout(shId,repId){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
+  if(sh.repPayout)delete sh.repPayout[repId];
+  mClose();saveS();toast('Override cleared — using auto');renderCur();
+}
+function openLogRepPmt(repId){
+  const rep=(S.reps||[]).find(r=>r.id===repId);if(!rep||rep.isSelf)return;
+  const earned=repEarned(repId);const paid=repPaid(repId);const owed=Math.max(0,earned-paid);
+  const today=new Date().toISOString().split('T')[0];
+  mOpen(`<div class="mh"><div class="mt">💰 Pay ${rep.name}</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="background:var(--redbg);border-radius:8px;padding:10px;margin-bottom:12px;font-size:12px">Earned: <strong style="color:var(--red)">${fmt(earned)}</strong> · Paid so far: <strong style="color:var(--green)">${fmt(paid)}</strong><br><strong style="color:var(--gold);font-size:14px">Outstanding: ${fmt(owed)}</strong></div>
+  <div class="fg"><label class="fl">Amount ($)</label><input class="fi" type="number" id="lp_amt" placeholder="${owed.toFixed(2)}" step="0.01" min="0" value="${owed>0?owed.toFixed(2):''}"></div>
+  <div class="fg"><label class="fl">Date</label><input class="fi" type="date" id="lp_date" value="${today}"></div>
+  <div class="fg"><label class="fl">Note (optional)</label><input class="fi" id="lp_note" placeholder="e.g. Cash after the show"></div>
+  <button class="btn btn-gold btn-full" onclick="saveRepPmt('${repId}')">✅ Log Payment</button>`);
+}
+function saveRepPmt(repId){
+  const rep=(S.reps||[]).find(r=>r.id===repId);if(!rep)return;
+  const amt=parseFloat($$('lp_amt').value); if(!amt||amt<=0){toast('Enter an amount');return;}
+  const date=$$('lp_date').value||new Date().toISOString().split('T')[0];
+  const note=($$('lp_note').value||'').trim();
+  if(!rep.payments)rep.payments=[];
+  rep.payments.push({id:'rp_'+Date.now(),date,amount:amt,note});
+  mClose();saveS();toast('✅ Payment logged for '+rep.name);rSettings();
+}
+function openAssignReps(shId){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
+  if(!sh.repIds)sh.repIds=[];
+  const reps=(S.reps||[]).filter(r=>r.active);
+  if(!reps.length){ toast('Add reps first in Settings → Team'); return; }
+  mOpen(`<div class="mh"><div class="mt">👥 Assign Reps</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:12px">${sh.name} — select everyone working this show</div>
+  ${reps.map(r=>`<label style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);cursor:pointer"><input type="checkbox" id="ar_${r.id}" ${sh.repIds.includes(r.id)?'checked':''} style="width:20px;height:20px"><div><div style="font-weight:700">${r.name}${r.isSelf?' 👑 (You)':''}</div></div></label>`).join('')}
+  <div style="margin-top:12px"><label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px 0;border-top:1px solid var(--border)"><input type="checkbox" id="ar_reponly" ${sh.repOnlyShow?'checked':''} style="width:20px;height:20px"><div style="font-size:12px;color:var(--muted)"><strong>Rep-only show</strong> — owner not attending</div></label></div>
+  <button class="btn btn-gold btn-full" style="margin-top:12px" onclick="saveAssignReps('${shId}')">✅ Save Roster</button>`);
+}
+function saveAssignReps(shId){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
+  const reps=(S.reps||[]).filter(r=>r.active);
+  sh.repIds=reps.filter(r=>$$('ar_'+r.id)&&$$('ar_'+r.id).checked).map(r=>r.id);
+  sh.repOnlyShow=!!($$('ar_reponly')&&$$('ar_reponly').checked);
+  (sh.days||[]).forEach(day=>{ if(!day.repSales)day.repSales=[]; sh.repIds.forEach(repId=>{ if(!day.repSales.find(x=>x.repId===repId)) day.repSales.push(_emptyRS(repId)); }); });
+  mClose();saveS();toast('✅ Roster saved!');rShow();
+}
+function openRepSalesEntry(shId,di,repId){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
+  const day=sh.days[di];if(!day)return;
+  if(!day.repSales)day.repSales=[];
+  const rep=(S.reps||[]).find(r=>r.id===repId);if(!rep)return;
+  let rs=day.repSales.find(x=>x.repId===repId);
+  if(!rs){rs=_emptyRS(repId);day.repSales.push(rs);}
+  const pmtFields=PMTS.map(p=>`<div class="fg"><label class="fl">${p.icon} ${p.label}${!rep.isSelf?` (${Math.round(commRateForKey(p.key)*100)}% comm)`:''}</label><input class="fi" type="number" id="rs_${p.key}" placeholder="0.00" step="0.01" min="0" value="${rs[p.key]||''}" inputmode="decimal"></div>`).join('');
+  mOpen(`<div class="mh"><div class="mt">💰 ${rep.name}${rep.isSelf?' 👑':''} — ${day.date}</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Enter totals collected by ${rep.name} for this day. Each payment type separately.</div>
+  ${pmtFields}
+  ${!rep.isSelf?`<div style="background:var(--redbg);border-radius:8px;padding:10px;margin-bottom:12px;font-size:13px;text-align:center">Commission will auto-calculate on save</div>`:''}
+  <button class="btn btn-gold btn-full" onclick="saveRepSalesEntry('${shId}',${di},'${repId}')">✅ Save Sales</button>`);
+}
+function saveRepSalesEntry(shId,di,repId){
+  const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
+  const day=sh.days[di];if(!day)return;
+  if(!day.repSales)day.repSales=[];
+  let rs=day.repSales.find(x=>x.repId===repId);
+  if(!rs){rs={repId};day.repSales.push(rs);}
+  PMTS.forEach(p=>{rs[p.key]=parseFloat($$('rs_'+p.key).value)||0;});
+  const comm=calcRepSalesComm({...rs,repId});
+  mClose();saveS();
+  toast('✅ Sales saved'+(comm>0?` · Comm: ${fmt(comm)}`:''));
+  go('show',shId,di);
+}
+
+// ===================================================
+// REPORTS & EXPORT — CSV download + print-to-PDF (offline, no libraries)
+// ===================================================
+function _csv(v){ if(v==null)v=''; v=String(v); return /[",\n\r]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v; }
+function _csvRows(rows){ return rows.map(r=>r.map(_csv).join(',')).join('\r\n'); }
+function _stamp(){ return new Date().toISOString().split('T')[0]; }
+function dlFile(name,text,mime){
+  try{
+    const blob=new Blob([text],{type:(mime||'text/csv')+';charset=utf-8'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download=name; document.body.appendChild(a); a.click();
+    setTimeout(()=>{document.body.removeChild(a);URL.revokeObjectURL(url);},150);
+    toast('📤 Saved '+name);
+  }catch(e){ toast('Export failed'); }
+}
+function _slug(s){ return String(s||'show').replace(/[^a-z0-9]+/gi,'-').toLowerCase().replace(/^-|-$/g,''); }
+function exportSeasonCSV(){
+  const rows=[['Show','Status','Dates','Location','Days','Potential Gross','Actual Collected','Discounts','COGS','Expenses','Commissions','Net Profit','Tax Reserve']];
+  (S.shows||[]).slice().sort((a,b)=>showSortKey(a)<showSortKey(b)?-1:1).forEach(sh=>{ const t=calcShow(sh);
+    rows.push([sh.name,sh.status,(sh.dates||[]).join(' - '),sh.location||'',sh.numDays||1,showPotentialRev(sh).toFixed(2),showActualRev(sh).toFixed(2),showDiscountTotal(sh).toFixed(2),t.cogs.toFixed(2),t.expenses.toFixed(2),(t.commissions||0).toFixed(2),t.profit.toFixed(2),(t.taxRes||0).toFixed(2)]); });
+  const y=calcYTD(); rows.push([]); rows.push(['SEASON TOTAL','','','','','','','',y.cogs.toFixed(2),y.expenses.toFixed(2),(y.totalCommissions||0).toFixed(2),y.profit.toFixed(2),(y.taxRes||0).toFixed(2)]);
+  dlFile('best-solution-season-'+_stamp()+'.csv',_csvRows(rows));
+}
+function exportShowCSV(shId){
+  const sh=(S.shows||[]).find(s=>s.id===shId); if(!sh)return; const t=calcShow(sh);
+  const rows=[['Day','Date','SKU','Units Sold','Unit Price','Line Revenue']];
+  (sh.days||[]).forEach((d,i)=>{ if(d.morningCount&&d.eveningCount){ const sold=calcSold(d.morningCount,d.eveningCount); SKUS.forEach(s=>{ const q=sold[s.key]||0; if(q>0) rows.push([i+1,d.date||'',s.short,q,getP(s.key).toFixed(2),(q*getP(s.key)).toFixed(2)]); }); } });
+  rows.push([]); rows.push(['Payments collected by method']); PMTS.forEach(p=>{ let tot=0; (sh.days||[]).forEach(d=>tot+=parseFloat((d.payments||{})[p.key])||0); if(tot>0)rows.push([p.label,'','','','',tot.toFixed(2)]); });
+  if((sh.discounts||[]).length){ rows.push([]); rows.push(['Discounts / Freebies']); (sh.discounts||[]).forEach(x=>rows.push([x.date||'',x.note||'','','','',(parseFloat(x.amount)||0).toFixed(2)])); }
+  rows.push([]); rows.push(['SUMMARY']);
+  rows.push(['Potential Gross','','','','',showPotentialRev(sh).toFixed(2)]);
+  rows.push(['Actual Collected','','','','',showActualRev(sh).toFixed(2)]);
+  rows.push(['Discounts','','','','',showDiscountTotal(sh).toFixed(2)]);
+  rows.push(['COGS','','','','',t.cogs.toFixed(2)]);
+  rows.push(['Expenses','','','','',t.expenses.toFixed(2)]);
+  rows.push(['Commissions','','','','',(t.commissions||0).toFixed(2)]);
+  rows.push(['Net Profit','','','','',t.profit.toFixed(2)]);
+  dlFile('best-solution-'+_slug(sh.name)+'-'+_stamp()+'.csv',_csvRows(rows));
+}
+function exportRepCSV(){
+  const rows=[['Rep','Owner?','Earned','Paid','Owed']];
+  (S.reps||[]).forEach(r=>{ const e=repEarned(r.id),p=repPaid(r.id); rows.push([r.name,r.isSelf?'yes':'no',e.toFixed(2),p.toFixed(2),Math.max(0,e-p).toFixed(2)]); });
+  dlFile('best-solution-rep-commissions-'+_stamp()+'.csv',_csvRows(rows));
+}
+function exportExpensesCSV(){
+  const rows=[['Date','Category','Amount','Note']];
+  (S.otherExpenses||[]).slice().sort((a,b)=>String(a.date).localeCompare(String(b.date))).forEach(e=>rows.push([e.date||'',e.category||'',(parseFloat(e.amount)||0).toFixed(2),e.note||'']));
+  rows.push([]); rows.push(['TOTAL','',(S.otherExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0).toFixed(2),'']);
+  dlFile('best-solution-expenses-'+_stamp()+'.csv',_csvRows(rows));
+}
+function _money(n){return '$'+(Number(n)||0).toFixed(2);}
+function _esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function _printHTML(title,body){
+  const doc='<!doctype html><html><head><meta charset="utf-8"><title>'+_esc(title)+'</title>'+
+  '<style>body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#111;margin:24px;font-size:13px}h1{font-size:20px;margin:0 0 2px}h2{font-size:15px;margin:18px 0 6px;border-bottom:2px solid #333;padding-bottom:3px}table{border-collapse:collapse;width:100%;margin:6px 0}td,th{border:1px solid #ccc;padding:5px 8px;text-align:left}th{background:#f0f0f0}.r{text-align:right}.muted{color:#666;font-size:11px}.tot{font-weight:800;background:#fafafa}@media print{.noprint{display:none}}</style>'+
+  '</head><body>'+body+'<div class="noprint" style="margin-top:20px"><button onclick="window.print()" style="padding:10px 16px;font-size:14px">Print / Save as PDF</button></div>'+
+  '<script>setTimeout(function(){window.print();},400);</'+'script></body></html>';
+  const url=URL.createObjectURL(new Blob([doc],{type:'text/html'}));
+  const w=window.open(url,'_blank');
+  if(!w){ toast('Allow pop-ups to print / save PDF'); }
+  setTimeout(()=>URL.revokeObjectURL(url),60000);
+}
+function printFullReport(){
+  const y=calcYTD();
+  const showRows=(S.shows||[]).slice().sort((a,b)=>showSortKey(a)<showSortKey(b)?-1:1).map(sh=>{const t=calcShow(sh);return '<tr><td>'+_esc(sh.name)+'</td><td>'+sh.status+'</td><td>'+_esc((sh.dates||[]).join(' - '))+'</td><td class="r">'+_money(showPotentialRev(sh))+'</td><td class="r">'+_money(showActualRev(sh))+'</td><td class="r">'+_money(t.cogs)+'</td><td class="r">'+_money(t.expenses)+'</td><td class="r">'+_money(t.profit)+'</td></tr>';}).join('');
+  const repRows=(S.reps||[]).filter(r=>!r.isSelf).map(r=>{const e=repEarned(r.id),p=repPaid(r.id);return (e>0||p>0)?'<tr><td>'+_esc(r.name)+'</td><td class="r">'+_money(e)+'</td><td class="r">'+_money(p)+'</td><td class="r">'+_money(Math.max(0,e-p))+'</td></tr>':'';}).join('');
+  const expRows=(S.otherExpenses||[]).slice().sort((a,b)=>String(a.date).localeCompare(String(b.date))).map(e=>'<tr><td>'+_esc(e.date||'')+'</td><td>'+_esc(e.category||'')+'</td><td class="r">'+_money(e.amount)+'</td><td>'+_esc(e.note||'')+'</td></tr>').join('');
+  const expTot=(S.otherExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
+  _printHTML('Best Solution — Season Report',
+    '<h1>Best Solution — 2026 Season Report</h1><div class="muted">Generated '+_stamp()+' · Dot Dynasty LLC</div>'+
+    '<h2>Season Totals</h2><table><tr><th>Gross</th><th>COGS</th><th>Expenses</th><th>Net Profit</th><th>Tax Reserve</th><th>Units Sold</th></tr><tr class="tot"><td class="r">'+_money(y.gross)+'</td><td class="r">'+_money(y.cogs)+'</td><td class="r">'+_money(y.expenses)+'</td><td class="r">'+_money(y.profit)+'</td><td class="r">'+_money(y.taxRes)+'</td><td class="r">'+fmtN(y.totalUnits)+'</td></tr></table>'+
+    '<h2>All Shows</h2><table><tr><th>Show</th><th>Status</th><th>Dates</th><th>Potential</th><th>Collected</th><th>COGS</th><th>Expenses</th><th>Profit</th></tr>'+showRows+'</table>'+
+    (repRows?'<h2>Rep Commissions</h2><table><tr><th>Rep</th><th>Earned</th><th>Paid</th><th>Owed</th></tr>'+repRows+'</table>':'')+
+    (expRows?'<h2>Other Expenses (write-offs)</h2><table><tr><th>Date</th><th>Category</th><th>Amount</th><th>Note</th></tr>'+expRows+'<tr class="tot"><td>TOTAL</td><td></td><td class="r">'+_money(expTot)+'</td><td></td></tr></table>':''));
+}
+function printShowReport(shId){
+  const sh=(S.shows||[]).find(s=>s.id===shId); if(!sh)return; const t=calcShow(sh);
+  let dayRows='';
+  (sh.days||[]).forEach((d,i)=>{ if(d.morningCount&&d.eveningCount){ const sold=calcSold(d.morningCount,d.eveningCount); SKUS.forEach(s=>{ const q=sold[s.key]||0; if(q>0) dayRows+='<tr><td>'+_esc(d.date||('Day '+(i+1)))+'</td><td>'+s.short+'</td><td class="r">'+q+'</td><td class="r">'+_money(getP(s.key))+'</td><td class="r">'+_money(q*getP(s.key))+'</td></tr>'; }); } });
+  let payRows=''; PMTS.forEach(p=>{ let tot=0; (sh.days||[]).forEach(d=>tot+=parseFloat((d.payments||{})[p.key])||0); if(tot>0)payRows+='<tr><td>'+p.label+'</td><td class="r">'+_money(tot)+'</td></tr>'; });
+  _printHTML('Best Solution — '+sh.name,
+    '<h1>'+_esc(sh.name)+'</h1><div class="muted">'+_esc(sh.location||'')+' · '+_esc((sh.dates||[]).join(' - '))+' · Generated '+_stamp()+'</div>'+
+    '<h2>Units Sold</h2><table><tr><th>Date</th><th>Product</th><th>Units</th><th>Price</th><th>Revenue</th></tr>'+(dayRows||'<tr><td colspan="5">No sales recorded</td></tr>')+'</table>'+
+    (payRows?'<h2>Payments Collected</h2><table><tr><th>Method</th><th>Amount</th></tr>'+payRows+'</table>':'')+
+    '<h2>Summary</h2><table>'+
+    '<tr><td>Potential Gross</td><td class="r">'+_money(showPotentialRev(sh))+'</td></tr>'+
+    '<tr><td>Actual Collected</td><td class="r">'+_money(showActualRev(sh))+'</td></tr>'+
+    '<tr><td>Discounts / Freebies</td><td class="r">'+_money(showDiscountTotal(sh))+'</td></tr>'+
+    '<tr><td>COGS</td><td class="r">'+_money(t.cogs)+'</td></tr>'+
+    '<tr><td>Expenses</td><td class="r">'+_money(t.expenses)+'</td></tr>'+
+    '<tr><td>Commissions</td><td class="r">'+_money(t.commissions||0)+'</td></tr>'+
+    '<tr class="tot"><td>Net Profit</td><td class="r">'+_money(t.profit)+'</td></tr></table>');
+}
+
+// ===================================================
 // SHOW DETAIL
 // ===================================================
 function rShow(){
@@ -1162,15 +1771,35 @@ function rShow(){
     <div><div class="sl">Tax Reserve</div><div class="sv sm r" style="font-size:14px">${fmt(t.taxRes)}</div></div>
     <div><div class="sl">Keep</div><div class="sv sm g" style="font-size:14px">${fmt(Math.max(0,t.profit-t.taxRes))}</div></div>
   </div>
+  <div class="card" style="margin-bottom:12px;border-color:rgba(0,210,106,0.25)">
+    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:8px">💵 REVENUE — POTENTIAL vs ACTUAL</div>
+    <div class="sr"><span class="srl">Potential (units sold × full price)</span><span class="srv gold">${fmt(showPotentialRev(sh))}</span></div>
+    <div class="sr"><span class="srl">Actual Collected (cash + card + apps)</span><span class="srv green">${fmt(showActualRev(sh))}</span></div>
+    <div class="sr"><span class="srl">Discounts / Freebies / Promos</span><span class="srv red">-${fmt(showDiscountTotal(sh))}</span></div>
+    <div class="sr" style="border-top:1px solid var(--border);margin-top:4px"><span class="srl b">Variance (Potential − Actual)</span><span class="srv b">${fmt(showPotentialRev(sh)-showActualRev(sh))}</span></div>
+    <button class="btn btn-xs btn-ghost" style="width:100%;margin-top:8px" onclick="openDiscountModal('${sh.id}')">+ Log Discount / Freebie / Promo</button>
+    ${(sh.discounts||[]).length?`<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px">${[...(sh.discounts||[])].slice().reverse().map(x=>`<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;padding:3px 0"><span style="color:var(--muted);min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${x.note||'(no note)'} <span style="opacity:.6">${x.date||''}</span></span><span style="display:flex;gap:8px;align-items:center;flex-shrink:0"><span style="color:var(--red);font-weight:700">-${fmt(x.amount)}</span><span style="cursor:pointer;color:var(--muted);font-weight:900" onclick="delDiscount('${sh.id}','${x.id}')">✕</span></span></div>`).join('')}</div>`:''}
+  </div>
   ${actBtn}
+  ${(sh.status==='active'||sh.status==='planned')?`<button class="btn btn-ghost btn-sm btn-full" style="margin-bottom:12px;border-color:rgba(79,195,247,0.4);color:#7EB8F7" onclick="openTransferModal('${sh.id}')">🔄 Transfer Stock to/from Another Show</button>`:''}
+  <div style="display:flex;gap:8px;margin-bottom:12px">
+    <button class="btn btn-ghost btn-sm" style="flex:1" onclick="exportShowCSV('${sh.id}')">📄 Export CSV</button>
+    <button class="btn btn-ghost btn-sm" style="flex:1" onclick="printShowReport('${sh.id}')">🖨️ Print / PDF</button>
+  </div>
   ${sh.status!=='planned'?`<div class="dtabs">${dtabs}</div>${rDay(sh,curDay)}`:''}
   <div class="card" style="margin-top:12px">
-    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:10px">SHOW DETAILS</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">SHOW DETAILS</div>
+      <button class="btn btn-xs" style="background:rgba(255,215,0,0.15);border:1px solid var(--goldbd);color:var(--gold)" onclick="showEditCosts('${sh.id}')">✏️ Edit Show</button>
+    </div>
     <div class="sr"><span class="srl">Booth Cost</span><span class="srv">${fmt(sh.boothCost||0)}</span></div>
     <div class="sr"><span class="srl">One-Way Miles</span><span class="srv">${sh.miles||0} mi</span></div>
-    <div class="sr"><span class="srl">Total Miles (${sh.numDays} days)</span><span class="srv">${(sh.miles||0)*2*sh.numDays} mi</span></div>
-    <div class="sr"><span class="srl">IRS Mileage Deduction</span><span class="srv green">${fmt((sh.miles||0)*2*sh.numDays*S.settings.irsRate)}</span></div>
-    <div class="sr"><span class="srl">Est. Gas Cost</span><span class="srv">${fmt(((sh.miles||0)*2*sh.numDays/S.settings.mpg)*S.settings.gasPrice)}</span></div>
+    <div class="sr"><span class="srl">Round Trips</span><span class="srv">${showRoundTrips(sh)}${(sh.roundTrips!=null&&sh.roundTrips!=='')?'':' (auto: 1/day)'}</span></div>
+    <div class="sr"><span class="srl">Total Miles Driven</span><span class="srv">${fmtN(showMiles(sh))} mi</span></div>
+    <div class="sr"><span class="srl">IRS Mileage Deduction</span><span class="srv green">${fmt(showMiles(sh)*S.settings.irsRate)}</span></div>
+    <div class="sr"><span class="srl">Gas Cost${(sh.gasOverride!=null&&sh.gasOverride!=='')?' (manual)':' (est.)'}</span><span class="srv">${fmt(showGas(sh))}</span></div>
+    <div class="sr"><span class="srl">Lodging / Hotel</span><span class="srv">${fmt(sh.lodging||0)}</span></div>
+    <div class="sr"><span class="srl">Tax Rate</span><span class="srv">${Math.round(showTaxRate(sh)*100)}%${(sh.taxRate!=null&&sh.taxRate!=='')?'':' (global)'}</span></div>
   </div>
   <div class="card" style="margin-top:10px;border-color:rgba(255,165,0,0.3)">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
@@ -1181,6 +1810,40 @@ function rShow(){
     ${(sh.showExpenses||[]).map(e=>{const cat=SHOW_EXP_CATS.find(c=>c.key===e.cat)||{icon:'💸',label:'Other'};return`<div class="sr"><span class="srl">${cat.icon} ${cat.label}${e.desc?' — '+e.desc:''}</span><span class="srv red">-${fmt(e.amount)}</span></div>`;}).join('')}
     <div class="sr" style="border-top:1px solid rgba(255,165,0,0.2);margin-top:4px"><span class="srl b">Total Other Expenses</span><span class="srv red lg">-${fmt((sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0))}</span></div>`}
   </div>
+  ${(()=>{
+    const allReps=(S.reps||[]).filter(r=>r.active);
+    const assigned=(sh.repIds||[]).map(id=>allReps.find(r=>r.id===id)).filter(Boolean);
+    const showComm=calcShowComm(sh);
+    return`<div class="card" style="margin-top:10px;border-color:rgba(79,195,247,0.3)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-size:10px;color:var(--blue);text-transform:uppercase;font-weight:700">👥 Reps This Show</div>
+        <div style="display:flex;gap:6px;align-items:center">${sh.repOnlyShow?'<span style="font-size:10px;color:var(--gold);font-weight:700">REP-ONLY SHOW</span>':''}<button class="btn btn-xs btn-ghost" title="Log hours worked & what you paid" onclick="showEditCosts('${sh.id}')">⏱ Hours</button><button class="btn btn-xs" style="background:rgba(79,195,247,0.12);border:1px solid rgba(79,195,247,0.3);color:var(--blue)" onclick="openAssignReps('${sh.id}')">✏️ Assign</button></div>
+      </div>
+      ${assigned.length===0?`<div style="font-size:12px;color:var(--muted)">No reps assigned. Tap Assign to add reps working this show. (Add your team in Settings → Team.)</div>`:`
+      ${assigned.map(r=>{const earned=repEarned(r.id,sh.id);const paid=repPaid(r.id,sh.id);const owed=Math.max(0,earned-paid);const auto=repShowCalcComm(sh,r.id);const ov=sh.repPayout&&sh.repPayout[r.id];const hasOv=ov!=null&&ov!=='';const _hrs=(sh.repHours&&sh.repHours[r.id]!=null)?(parseFloat(sh.repHours[r.id])||0):null;const _sales=repShowSales(sh,r.id);const _pay=repShowComm(sh,r.id);const _sub=[];if(_hrs)_sub.push(_hrs+'h');if(_hrs&&_pay)_sub.push(fmt(_pay/_hrs)+'/hr');if(_sales)_sub.push('sold '+fmt(_sales));if(_hrs&&_sales)_sub.push(fmt(_sales/_hrs)+'/hr sold');return`<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px"><div><div style="font-weight:700">${r.name}${r.isSelf?' 👑':''}</div>${_sub.length?`<div style="font-size:9px;color:var(--muted)">${_sub.join(' · ')}</div>`:''}</div><div style="text-align:right;display:flex;align-items:center;gap:8px"><div>${earned>0?`<div style="color:var(--red)">${hasOv?'Payout':'Earned'}: ${fmt(earned)}</div>${owed>0?`<div style="color:var(--gold);font-weight:800">Owed: ${fmt(owed)}</div>`:`<div style="color:var(--green)">✓ Paid</div>`}${hasOv?`<div style="font-size:9px;color:var(--muted)">auto ${fmt(auto)}</div>`:''}`:(hasOv?`<div style="color:var(--gold);font-weight:800">Payout: ${fmt(earned)}</div>`:'<div style="color:var(--muted)">No sales yet</div>')}</div>${!r.isSelf?`<button class="btn btn-xs btn-ghost" title="Edit what you actually paid this rep for this show" onclick="openEditPayout('${sh.id}','${r.id}')">✏️ Payout</button>`:''}</div></div>`;}).join('')}
+      ${showComm>0?`<div style="margin-top:8px;display:flex;justify-content:space-between;font-size:12px;font-weight:800"><span>Total Commissions / Payouts</span><span style="color:var(--red)">-${fmt(showComm)}</span></div>`:''}
+      ${assigned.filter(r=>!r.isSelf).length?`<div style="margin-top:10px;border-top:1px dashed var(--border);padding-top:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:6px">🔒 Commission Detail (manager) — per-rep rates</div>${assigned.filter(r=>!r.isSelf).map(r=>{const rt=repCommRates(r);let cash=0,cardElec=0;(sh.days||[]).forEach(d=>{(d.repSales||[]).forEach(rs=>{if(rs.repId===r.id){PMTS.forEach(p=>{const v=parseFloat(rs[p.key])||0;if(CASH_COMM_KEYS.includes(p.key))cash+=v;else cardElec+=v;});}});});const autoC=cash*rt.cash+cardElec*rt.card;const ov=sh.repPayout&&sh.repPayout[r.id];const hasOv=ov!=null&&ov!=='';if(cash===0&&cardElec===0&&!hasOv)return'';return`<div style="font-size:11px;padding:4px 0;border-bottom:1px solid var(--border)"><div style="display:flex;justify-content:space-between;font-weight:700"><span>${r.name}</span><span style="color:var(--red)">${fmt(hasOv?(parseFloat(ov)||0):autoC)}</span></div><div style="color:var(--muted)">Cash ${fmt(cash)}×${Math.round(rt.cash*100)}% = ${fmt(cash*rt.cash)} · Card/Elec ${fmt(cardElec)}×${Math.round(rt.card*100)}% = ${fmt(cardElec*rt.card)}${hasOv?` · <b style="color:var(--gold)">manual payout ${fmt(parseFloat(ov)||0)}</b>`:''}</div></div>`;}).join('')}</div>`:''}`}
+    </div>`;
+  })()}
+  ${(()=>{
+    const auto=showAutoSupplyUnits(sh); const sc=showSupplyCost(sh);
+    const autoRows=Object.keys(auto).map(name=>{const sup=(S.supplies||[]).find(x=>x.name===name);const c=sup?(parseFloat(sup.cost)||0):0;return `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span>${name} × ${auto[name]}</span><span style="color:var(--muted)">${fmt(auto[name]*c)}</span></div>`;}).join('');
+    const manRows=(sh.supplyUse||[]).map(u=>{const sup=(S.supplies||[]).find(x=>x.name===u.name);const c=sup?(parseFloat(sup.cost)||0):(parseFloat(u.cost)||0);return `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span>${u.name} × ${u.qty}</span><span style="color:var(--muted)">${fmt((parseFloat(u.qty)||0)*c)}</span></div>`;}).join('');
+    const bagN=showBagCount(sh); const bagC=showBagCost(sh);
+    const flatOn=!(typeof isMissed==='function'&&isMissed(sh));
+    const candyC=flatOn?candyPerShow():0; const paperC=flatOn?paperPerShow():0;
+    return `<div class="card" style="margin-top:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">🧴 Supplies Used</div><button class="btn btn-xs btn-ghost" onclick="openSupplyUse('${sh.id}')">✏️ Edit</button></div>
+      ${(bagN||candyC||paperC)?`<div style="font-size:9px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Bags &amp; overhead</div>
+        ${bagN?`<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span>Lace bags × ${bagN} <span style="color:var(--muted)">@ ${fmt(bagUnitCost())}</span></span><span style="color:var(--muted)">${fmt(bagC)}</span></div>`:''}
+        ${candyC?`<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span>Candy (flat)</span><span style="color:var(--muted)">${fmt(candyC)}</span></div>`:''}
+        ${paperC?`<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span>Paper towels (flat)</span><span style="color:var(--muted)">${fmt(paperC)}</span></div>`:''}`:''}
+      ${autoRows?`<div style="font-size:9px;color:var(--muted);text-transform:uppercase;margin:6px 0 2px">Auto give-aways (from sales)</div>${autoRows}`:''}
+      ${manRows?`<div style="font-size:9px;color:var(--muted);text-transform:uppercase;margin:6px 0 2px">Manual</div>${manRows}`:''}
+      ${sc>0?`<div style="display:flex;justify-content:space-between;font-weight:800;font-size:12px;margin-top:6px;border-top:1px solid var(--border);padding-top:6px"><span>Supply cost (in expenses)</span><span style="color:var(--red)">-${fmt(sc)}</span></div>`:'<div style="font-size:12px;color:var(--muted)">No supply cost yet.</div>'}
+    </div>`;
+  })()}
+  ${sh.notes?`<div class="card" style="margin-top:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:4px">📝 Show Notes</div><div style="font-size:13px;white-space:pre-wrap">${(sh.notes||'').replace(/</g,'&lt;')}</div></div>`:''}
   <div style="height:10px"></div>`;
 }
 
@@ -1193,8 +1856,10 @@ function rDay(sh,di){
   const pmtT=calcPmt(d.payments||{});
   const dayExp=Object.values(d.expenses||{}).reduce((a,b)=>a+(parseFloat(b)||0),0);
   const bpd=(sh.boothCost||0)/sh.numDays;
-  const profit=rev-cogs-dayExp-bpd;
-  const taxRes=Math.max(0,profit*S.settings.tax);
+  const dayComm=dayCommEffective(sh,di); // reflects MANUAL payout overrides (split across days)
+  const dayLoss=Math.max(0,rev-pmtT); // potential not collected (discounts/freebies/shortfall)
+  const profit=pmtT-cogs-dayExp-bpd-dayComm; // net is REAL CASH: money collected minus this day's costs
+  const taxRes=Math.max(0,profit*showTaxRate(sh));
   const soldChips=sold?SKUS.filter(s=>(sold[s.key]||0)>0).map(s=>`<span class="chip gold">${s.short}: <strong>${sold[s.key]}</strong></span>`).join(''):'';
   let moneyCheck='';
   if(haP&&rev>0){const diff=Math.abs(pmtT-rev);moneyCheck=diff>0.50?`<div class="wb ${pmtT>rev?'gold':'red'}" style="margin-top:8px">${pmtT>rev?'⚠️ Collected MORE than inventory shows. Check counts.':'⚠️ Missing '+fmt(rev-pmtT)+'. Collected less than inventory.'}</div>`:`<div class="wb green" style="margin-top:8px">✓ Money matches inventory. Good to go.</div>`;}
@@ -1238,16 +1903,32 @@ function rDay(sh,di){
       <span class="chip">Other: <strong>${fmt(d.expenses?.other||0)}</strong></span>
     </div>`:''}
     ${haM&&haE?`<div class="div"></div>
-    <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">DAY SUMMARY</div>
-    <div class="sr"><span class="srl">Gross Revenue</span><span class="srv gold">${fmt(rev)}</span></div>
+    <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">DAY SUMMARY · REAL CASH</div>
+    <div class="sr"><span class="srl">Money Collected</span><span class="srv gold">${fmt(pmtT)}</span></div>
+    ${rev>0?`<div class="sr"><span class="srl" style="color:var(--muted)">Potential (full price)</span><span class="srv" style="color:var(--muted)">${fmt(rev)}</span></div>`:''}
+    ${dayLoss>0.005?`<div class="sr"><span class="srl">Loss (discounts/freebies)</span><span class="srv red">-${fmt(dayLoss)}</span></div>`:''}
     <div class="sr"><span class="srl">Product Cost (COGS)</span><span class="srv">-${fmt(cogs)}</span></div>
     <div class="sr"><span class="srl">Day Expenses</span><span class="srv">-${fmt(dayExp)}</span></div>
     <div class="sr"><span class="srl">Booth Share</span><span class="srv">-${fmt(bpd)}</span></div>
-    <div class="sr"><span class="srl b">Net Profit</span><span class="srv lg ${profit>=0?'green':'red'}">${fmt(profit)}</span></div>
-    <div class="sr"><span class="srl">Tax Reserve (${Math.round(S.settings.tax*100)}%)</span><span class="srv red">-${fmt(taxRes)}</span></div>
+    ${dayComm>0?`<div class="sr"><span class="srl">Rep Commissions</span><span class="srv red">-${fmt(dayComm)}</span></div>`:''}
+    <div class="sr"><span class="srl b">Net Profit (cash)</span><span class="srv lg ${profit>=0?'green':'red'}">${fmt(profit)}</span></div>
+    <div class="sr"><span class="srl">Tax Reserve (${Math.round(showTaxRate(sh)*100)}%${(sh.taxRate!=null&&sh.taxRate!=='')?' · show rate':''})</span><span class="srv red">-${fmt(taxRes)}</span></div>
     <div class="sr"><span class="srl b">Keep</span><span class="srv lg green">${fmt(Math.max(0,profit-taxRes))}</span></div>`:''}
     ${isA?`<div class="div"></div><div class="fg"><label class="fl">Notes / What Worked</label><textarea class="fi" placeholder="Best sellers? Weather? What to restock?" onchange="saveDayNote('${sh.id}',${di},this.value)">${d.notes||''}</textarea></div>`
     :d.notes?`<div class="div"></div><div style="font-size:12px;color:var(--muted)"><strong>Notes:</strong> ${d.notes}</div>`:''}
+    ${(()=>{
+      const showReps=(sh.repIds||[]).filter(id=>{const r=(S.reps||[]).find(x=>x.id===id);return r&&r.active;});
+      if(!showReps.length)return'';
+      const dc=calcDayComm(d);
+      const repRows=showReps.map(repId=>{
+        const rep=(S.reps||[]).find(r=>r.id===repId);if(!rep)return'';
+        const rs=(d.repSales||[]).find(x=>x.repId===repId)||_emptyRS(repId);
+        const repTotal=PMTS.reduce((t,p)=>t+(parseFloat(rs[p.key])||0),0);
+        const repComm=calcRepSalesComm({...rs,repId});
+        return`<div style="background:var(--card2);border-radius:8px;padding:10px 12px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="font-weight:800;font-size:13px">${rep.name}${rep.isSelf?' 👑':''}</div><div style="text-align:right"><div style="font-size:13px;font-weight:900;color:var(--gold)">${fmt(repTotal)}</div>${!rep.isSelf&&repComm>0?`<div style="font-size:10px;color:var(--red)">Comm: ${fmt(repComm)}</div>`:''}</div></div><button class="btn btn-xs btn-ghost" style="width:100%" onclick="openRepSalesEntry('${sh.id}',${di},'${repId}')">✏️ Log Sales for ${rep.name}</button></div>`;
+      }).join('');
+      return`<div class="div"></div><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.5px">Rep Sales & Commissions</div>${dc>0?`<div style="font-size:11px;color:var(--red);font-weight:700">Total Comm: ${fmt(dc)}</div>`:''}</div>${repRows}`;
+    })()}
   </div>`;
 }
 
@@ -1413,28 +2094,66 @@ function saveBoothPmt(shId){
 // ===================================================
 // OTHER EXPENSES (supplies, equipment, misc)
 // ===================================================
-function openOtherExpense(presetCategory){
-  const cat=presetCategory||'';
+function openOtherExpense(presetCategory,editId){
+  const ex=editId?(S.otherExpenses||[]).find(e=>e.id===editId):null;
+  const cat=ex?(ex.category||''):(presetCategory||'');
   const today=new Date().toISOString().split('T')[0];
-  const categories=['Supplies','Equipment','Marketing','Travel','Other'];
-  mOpen(`<div class="mh"><div class="mt">💸 Log Expense</div><button class="mx" onclick="mClose()">×</button></div>
+  const categories=['Supplies','Equipment','Marketing','Travel','Insurance','Software/Marketing','IT Services','Other'];
+  if(cat&&!categories.includes(cat))categories.unshift(cat);
+  const noteVal=String(ex&&ex.note!=null?ex.note:'').replace(/"/g,'&quot;');
+  mOpen(`<div class="mh"><div class="mt">${ex?'✏️ Edit Expense':'💸 Log Expense'}</div><button class="mx" onclick="mClose()">×</button></div>
   <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Bags, paper towels, equipment, canopy, table — anything you spent money on.</div>
-  <div class="fg"><label class="fl">AMOUNT ($)</label><input class="fi" type="number" id="oe_amt" placeholder="0.00" step="0.01" min="0.01"></div>
-  <div class="fg"><label class="fl">WHAT WAS IT? (description)</label><input class="fi" id="oe_note" placeholder="e.g. Paper bags x2 packs, Costco run"></div>
+  <div class="fg"><label class="fl">AMOUNT ($)</label><input class="fi" type="number" id="oe_amt" placeholder="0.00" step="0.01" min="0.01" value="${ex?ex.amount:''}"></div>
+  <div class="fg"><label class="fl">WHAT WAS IT? (description)</label><input class="fi" id="oe_note" placeholder="e.g. Paper bags x2 packs, Costco run" value="${noteVal}"></div>
   <div class="fg"><label class="fl">CATEGORY</label><select class="fi" id="oe_cat">${categories.map(c=>`<option value="${c}"${c===cat?' selected':''}>${c}</option>`).join('')}</select></div>
-  <div class="fg"><label class="fl">DATE</label><input class="fi" type="date" id="oe_date" value="${today}"></div>
-  <button class="btn btn-gold btn-full" onclick="saveOtherExpense()">✅ Save Expense</button>
-  <button class="btn btn-ghost btn-full" style="margin-top:8px" onclick="mClose()">Cancel</button>`);
+  <div class="fg"><label class="fl">DATE</label><input class="fi" type="date" id="oe_date" value="${ex?ex.date:today}"></div>
+  <button class="btn btn-gold btn-full" onclick="saveOtherExpense(${ex?`'${ex.id}'`:''})">✅ ${ex?'Save Changes':'Save Expense'}</button>
+  ${ex?`<button class="btn btn-full" style="margin-top:8px;background:var(--redbg);border:1px solid var(--redbd);color:var(--red)" onclick="delOtherExpense('${ex.id}')">🗑️ Delete This Expense</button>`:''}
+  <button class="btn btn-ghost btn-full" style="margin-top:8px" onclick="${ex?'openManageExpenses()':'mClose()'}">${ex?'← Back to list':'Cancel'}</button>`);
 }
-function saveOtherExpense(){
+function saveOtherExpense(editId){
   const amt=parseFloat($$('oe_amt').value);
   if(!amt||amt<=0){toast('Enter a valid amount');return;}
   const note=$$('oe_note').value||'';
   const category=$$('oe_cat').value||'Other';
   const date=$$('oe_date').value||new Date().toISOString().split('T')[0];
   if(!S.otherExpenses)S.otherExpenses=[];
-  S.otherExpenses.push({id:'oe_'+Date.now(),amount:amt,note,category,date});
-  mClose();saveS();toast('✅ Expense logged — '+fmt(amt));
+  if(editId){
+    const ex=S.otherExpenses.find(e=>e.id===editId);
+    if(ex){ex.amount=amt;ex.note=note;ex.category=category;ex.date=date;}
+    saveS();openManageExpenses();toast('✅ Expense updated');
+  }else{
+    S.otherExpenses.push({id:'oe_'+Date.now(),amount:amt,note,category,date});
+    mClose();saveS();toast('✅ Expense logged — '+fmt(amt));
+  }
+}
+function delOtherExpense(id){
+  const ex=(S.otherExpenses||[]).find(e=>e.id===id);if(!ex)return;
+  if(!confirm('Delete this expense?\n\n'+(ex.note||ex.category||'Expense')+' — '+fmt(ex.amount)))return;
+  S.otherExpenses=(S.otherExpenses||[]).filter(e=>e.id!==id);
+  saveS();openManageExpenses();toast('🗑️ Expense deleted');
+}
+function openManageExpenses(){
+  const list=[...(S.otherExpenses||[])].sort((a,b)=>String(b.date||'').localeCompare(String(a.date||'')));
+  const total=list.reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
+  const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const rows=list.length?list.map(e=>`
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="min-width:0;flex:1;cursor:pointer" onclick="openOtherExpense('','${e.id}')">
+        <div style="font-weight:700;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.note||e.category||'Expense')}</div>
+        <div style="font-size:10px;color:var(--muted)">${esc(e.date||'')}${e.category?' · '+esc(e.category):''}</div>
+      </div>
+      <div style="color:var(--red);font-weight:900;font-size:13px;white-space:nowrap">${fmt(e.amount)}</div>
+      <button class="btn btn-xs btn-ghost" title="Edit" onclick="openOtherExpense('','${e.id}')">✏️</button>
+      <button class="btn btn-xs" title="Delete" style="background:var(--redbg);border:1px solid var(--redbd);color:var(--red)" onclick="delOtherExpense('${e.id}')">🗑️</button>
+    </div>`).join(''):'<div style="font-size:12px;color:var(--muted);text-align:center;padding:14px 0">No expenses logged yet. Tap “+ Add” to log one.</div>';
+  mOpen(`<div class="mh"><div class="mt">🧾 Manage Expenses</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <div style="font-size:12px;color:var(--muted)">${list.length} item(s) · Total <strong style="color:var(--red)">${fmt(total)}</strong></div>
+    <button class="btn btn-gold btn-sm" onclick="openOtherExpense()">+ Add</button>
+  </div>
+  <div id="manageExpList" style="max-height:58vh;overflow-y:auto;-webkit-overflow-scrolling:touch">${rows}</div>
+  <button class="btn btn-ghost btn-full" style="margin-top:10px" onclick="mClose()">Done</button>`);
 }
 
 // ===================================================
@@ -1504,9 +2223,12 @@ function rCalendar(){
   h+='<div class="cal-grid">';
   DOW.forEach(d=>h+=`<div class="cal-dow">${d}</div>`);
   for(let i=0;i<startDow;i++)h+='<div class="cal-cell blank"></div>';
+  let conflictDays=0;
   for(let day=1;day<=daysInMonth;day++){
     const ds=`${mKey}-${String(day).padStart(2,'0')}`;
     const shows=dayMap[ds]||[];
+    const conflict=shows.length>1;
+    if(conflict)conflictDays++;
     let cls='cal-cell',onclick='';
     if(ds===todayStr)cls+=' today';
     if(shows.length){
@@ -1514,16 +2236,17 @@ function rCalendar(){
       if(shows.some(s=>s.status==='completed'))st='completed';
       else if(shows.some(s=>s.confirmed||s.status==='active'))st='confirmed';
       cls+=` has-show ${st}`;
+      if(conflict)cls+=' conflict';
       onclick=` onclick="go('show','${shows[0].id}')"`;
     }
-    h+=`<div class="${cls}"${onclick}><div class="cal-num">${day}</div>`;
+    h+=`<div class="${cls}"${onclick}><div class="cal-num">${day}${conflict?' <span style="color:var(--red);font-size:10px">⚠️</span>':''}</div>`;
     shows.slice(0,2).forEach(s=>{h+=`<div class="cal-show-pill">${s.name}</div>`;});
     if(shows.length>2)h+=`<div class="cal-show-pill">+${shows.length-2} more</div>`;
     h+='</div>';
   }
   h+='</div>';
-  h+=`<div class="cal-legend"><span><span class="cal-legend-dot" style="background:var(--green)"></span>Booked</span><span><span class="cal-legend-dot" style="background:var(--gold)"></span>Pending</span><span><span class="cal-legend-dot" style="background:rgba(0,210,106,0.55)"></span>Completed</span></div>`;
-  h+=`<div style="text-align:center;font-size:12px;color:var(--muted);margin-top:10px">${monthDays} show day${monthDays===1?'':'s'} in ${MN[m]}</div>`;
+  h+=`<div class="cal-legend"><span><span class="cal-legend-dot" style="background:var(--green)"></span>Booked</span><span><span class="cal-legend-dot" style="background:var(--gold)"></span>Pending</span><span><span class="cal-legend-dot" style="background:rgba(0,210,106,0.55)"></span>Completed</span><span><span class="cal-legend-dot" style="background:var(--red)"></span>⚠️ Conflict</span></div>`;
+  h+=`<div style="text-align:center;font-size:12px;color:var(--muted);margin-top:10px">${monthDays} show day${monthDays===1?'':'s'} in ${MN[m]}${conflictDays?` · <span style="color:var(--red);font-weight:700">${conflictDays} conflict day${conflictDays>1?'s':''}</span>`:''}</div>`;
   h+=`<button class="btn btn-ghost btn-full" style="margin-top:12px" onclick="calToday()">Jump to This Month</button>`;
   h+=`<button class="btn btn-ghost btn-full" style="margin-top:8px" onclick="exportCalICS()">Export Shows to Calendar (.ics)</button>`;
   pg('calendar').innerHTML=h;
@@ -1551,16 +2274,19 @@ function rSupplies(){
   } else {
     sup.forEach((s,i)=>{
       const isLow=s.qty<=s.low&&s.low>0;
+      const cost=parseFloat(s.cost)||0;
+      const autoLbl=(s.autoSizes&&s.autoSizes.length)?s.autoSizes.map(k=>{const sk=SKUS.find(x=>x.key===k);return sk?sk.short:k;}).join('/'):'';
       h+=`<div class="cr">
         <div class="cr-i">
           <div class="cr-n" style="${isLow?'color:var(--red)':''}">${s.name}</div>
-          <div class="cr-s">${isLow?'⚠️ LOW · ':''}<span style="color:var(--muted)">min ${s.low} ${s.unit||'ea'}</span></div>
+          <div class="cr-s">${isLow?'⚠️ LOW · ':''}<span style="color:var(--muted)">min ${s.low} ${s.unit||'ea'}${cost>0?' · '+fmt(cost)+'/ea':''}${autoLbl?' · 🎁 '+autoLbl:''}</span></div>
         </div>
         <div class="cr-c">
           <button class="crb" onclick="adjSup(${i},-1)">−</button>
           <input class="cri" type="number" min="0" value="${s.qty}" style="${isLow?'border-color:var(--red);color:var(--red)':''}" onchange="setSup(${i},this.value)">
           <button class="crb" onclick="adjSup(${i},1)">+</button>
-          <button onclick="delSup(${i})" style="background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;padding:4px;margin-left:2px" title="Delete">🗑</button>
+          <button onclick="openSupEdit(${i})" style="background:none;border:none;color:var(--muted);font-size:15px;cursor:pointer;padding:4px;margin-left:2px" title="Cost & give-away settings">⚙️</button>
+          <button onclick="delSup(${i})" style="background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;padding:4px" title="Delete">🗑</button>
         </div>
       </div>`;
     });
@@ -1568,15 +2294,62 @@ function rSupplies(){
   h+='</div>';
   h+=`<div class="sec-lbl">ADD ITEM</div>
   <div class="card">
-    <div class="fg"><label class="fl">ITEM NAME</label><input class="fi" id="sup-new-name" placeholder="e.g. Paper Bags"></div>
+    <div class="fg"><label class="fl">ITEM NAME</label><input class="fi" id="sup-new-name" placeholder="e.g. Small lacy bag"></div>
     <div class="g2" style="gap:8px;margin-bottom:11px">
       <div><label class="fl">QUANTITY</label><input class="fi" id="sup-new-qty" type="number" min="0" placeholder="0" style="font-size:16px"></div>
       <div><label class="fl">LOW ALERT AT</label><input class="fi" id="sup-new-low" type="number" min="0" placeholder="2" style="font-size:16px"></div>
     </div>
-    <div class="fg"><label class="fl">UNIT (optional)</label><input class="fi" id="sup-new-unit" placeholder="ea, roll, pk, bag…"></div>
+    <div class="g2" style="gap:8px;margin-bottom:11px">
+      <div><label class="fl">UNIT (optional)</label><input class="fi" id="sup-new-unit" placeholder="ea, roll, bag…"></div>
+      <div><label class="fl">COST $/UNIT</label><input class="fi" id="sup-new-cost" type="number" min="0" step="0.001" placeholder="0.00" style="font-size:16px"></div>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">After adding, tap ⚙️ to set which bottle sizes give it away (auto-counts per show).</div>
     <button class="btn btn-gold btn-full" onclick="addSupItem()">+ ADD ITEM</button>
   </div>`;
   pg('supplies').innerHTML=h;
+}
+function openSupEdit(i){
+  const s=(S.supplies||[])[i]; if(!s)return;
+  const sizes=s.autoSizes||[];
+  mOpen(`<div class="mh"><div class="mt">⚙️ ${s.name}</div><button class="mx" onclick="mClose()">×</button></div>
+  <div class="fg"><label class="fl">Name</label><input class="fi" id="se_name" value="${(s.name||'').replace(/"/g,'&quot;')}"></div>
+  <div class="g2" style="gap:8px">
+    <div class="fg"><label class="fl">Cost $/unit</label><input class="fi" id="se_cost" type="number" min="0" step="0.001" value="${(s.cost!=null&&s.cost!=='')?s.cost:''}" placeholder="0.00"></div>
+    <div class="fg"><label class="fl">Unit</label><input class="fi" id="se_unit" value="${s.unit||''}" placeholder="ea"></div>
+  </div>
+  <div class="fg"><label class="fl">Low alert at</label><input class="fi" id="se_low" type="number" min="0" value="${s.low!=null?s.low:''}" placeholder="2"></div>
+  <div class="fg"><label class="fl">🎁 Given away automatically with (1 per unit sold)</label>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px">
+      ${SKUS.map(sk=>`<label style="display:flex;align-items:center;gap:5px;font-size:12px;background:var(--card2);padding:6px 9px;border-radius:8px;cursor:pointer"><input type="checkbox" class="se_sz" value="${sk.key}" ${sizes.includes(sk.key)?'checked':''}> ${sk.short}</label>`).join('')}
+    </div>
+  </div>
+  <div style="font-size:11px;color:var(--muted);margin:-2px 0 12px">e.g. small lacy bag → check 2oz; large lacy → check 16oz & 32oz. Leave all unchecked for supplies you tally manually per show.</div>
+  <button class="btn btn-gold btn-full" onclick="saveSupEdit(${i})">Save</button>`);
+}
+function saveSupEdit(i){
+  const s=(S.supplies||[])[i]; if(!s)return;
+  s.name=($$('se_name').value||s.name).trim();
+  const c=($$('se_cost').value||'').trim(); s.cost=c===''?null:(parseFloat(c)||0);
+  s.unit=($$('se_unit').value||'').trim()||'ea';
+  const lo=($$('se_low').value||'').trim(); s.low=lo===''?0:(parseInt(lo)||0);
+  s.autoSizes=[...document.querySelectorAll('.se_sz:checked')].map(el=>el.value);
+  mClose();saveS();toast('✅ Saved');rSupplies();
+}
+function openSupplyUse(shId){
+  const sh=S.shows.find(s=>s.id===shId); if(!sh)return;
+  const sups=(S.supplies||[]).filter(s=>!(s.autoSizes&&s.autoSizes.length));
+  const useMap={}; (sh.supplyUse||[]).forEach(u=>useMap[u.name]=u.qty);
+  mOpen(`<div class="mh"><div class="mt">🧴 Supplies Used</div><button class="mx" onclick="mClose()">×</button></div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:10px">${sh.name} — how many of each you used (paper towels, liners, skirts, tables…). Lacy bags auto-count from sales.</div>
+  ${sups.length?sups.map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)"><div style="font-size:13px"><div style="font-weight:700">${s.name}</div><div style="font-size:11px;color:var(--muted)">${(parseFloat(s.cost)||0)?fmt(parseFloat(s.cost))+'/'+(s.unit||'ea'):'no cost set'}</div></div><input class="fi su_use" data-name="${(s.name||'').replace(/"/g,'&quot;')}" type="number" min="0" step="1" value="${useMap[s.name]!=null?useMap[s.name]:''}" placeholder="0" style="max-width:90px"></div>`).join(''):'<div style="font-size:12px;color:var(--muted)">No manual supplies yet. Add items on the Supplies page (leave their give-away sizes unchecked) and set a cost.</div>'}
+  <button class="btn btn-gold btn-full" style="margin-top:12px" onclick="saveSupplyUse('${shId}')">Save</button>`);
+}
+function saveSupplyUse(shId){
+  const sh=S.shows.find(s=>s.id===shId); if(!sh)return;
+  const out=[];
+  [...document.querySelectorAll('.su_use')].forEach(el=>{const q=parseFloat(el.value)||0; if(q>0)out.push({name:el.getAttribute('data-name'),qty:q});});
+  sh.supplyUse=out;
+  mClose();saveS();toast('✅ Supplies saved');renderCur();
 }
 function adjSup(i,delta){
   if(!S.supplies||!S.supplies[i])return;
@@ -1601,8 +2374,9 @@ function addSupItem(){
   const qty=parseInt($$('sup-new-qty').value)||0;
   const low=parseInt($$('sup-new-low').value)||2;
   const unit=($$('sup-new-unit').value||'').trim()||'ea';
+  const costRaw=($$('sup-new-cost')||{}).value; const cost=(costRaw==null||costRaw==='')?null:(parseFloat(costRaw)||0);
   if(!S.supplies)S.supplies=[];
-  S.supplies.push({id:'sup_'+Date.now(),name,qty,low,unit});
+  S.supplies.push({id:'sup_'+Date.now(),name,qty,low,unit,cost,autoSizes:[]});
   saveS();
   toast('✅ '+name+' added');
 }
@@ -1625,8 +2399,18 @@ function rSettings(){
   <div class="fg"><label class="fl">MPG (default: 17.5)</label><input class="fi" type="number" id="st_m" value="${s.mpg}" step="0.1" onchange="setSt('mpg',parseFloat(this.value))"></div>
   <div class="fg"><label class="fl">IRS Mileage Rate ($/mile)</label><input class="fi" type="number" id="st_i" value="${s.irsRate}" step="0.01" onchange="setSt('irsRate',parseFloat(this.value))"></div>
   </div>
+  <div class="card"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:10px">🧴 SHOW SUPPLY COSTS</div>
+  <div class="fg"><label class="fl">Lace bag cost ($ each)</label><input class="fi" type="number" id="st_bag" value="${bagUnitCost()}" step="0.01" min="0" onchange="setSt('bagCost',parseFloat(this.value))"></div>
+  <div class="fg"><label class="fl">Candy per show ($)</label><input class="fi" type="number" id="st_candy" value="${candyPerShow()}" step="1" min="0" onchange="setSt('candyPerShow',parseFloat(this.value))"></div>
+  <div class="fg"><label class="fl">Paper towels per show ($)</label><input class="fi" type="number" id="st_paper" value="${paperPerShow()}" step="1" min="0" onchange="setSt('paperPerShow',parseFloat(this.value))"></div>
+  <div style="font-size:11px;color:var(--muted)">Bags auto-count from bottles sold: 2oz = ½ bag, 8oz/16oz/32oz = 1 bag each (C5 rides along). Candy + paper towels are flat per show. All auto-added to each show's expenses &amp; break-even.</div>
+  </div>
   <div class="card"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:10px">DEFAULT SELL PRICES</div>
   ${SKUS.map(s=>`<div class="fg"><label class="fl">${s.name} (cost: ${fmt(s.cost)} · margin: ${Math.round(((getP(s.key)-s.cost)/getP(s.key))*100)}%)</label><input class="fi" type="number" id="sp_${s.key}" value="${getP(s.key)}" step="0.50" onchange="setP('${s.key}',parseFloat(this.value))"></div>`).join('')}
+  </div>
+  <div class="card bb"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div style="font-size:10px;color:var(--blue);text-transform:uppercase;font-weight:700">👥 TEAM / REPS</div><button class="btn btn-xs" style="background:rgba(79,195,247,0.12);border:1px solid rgba(79,195,247,0.3);color:var(--blue)" onclick="openAddRep()">+ Add Rep</button></div>
+  <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Commission auto-calcs at <strong>35% cash · 30% card+electronic</strong>. Mark each rep's sales per show day. 👑 = owner (earns no commission).</div>
+  ${(S.reps||[]).filter(r=>r.active).length?`${(S.reps||[]).filter(r=>r.active).map(r=>{const earned=repEarned(r.id),paid=repPaid(r.id),owed=Math.max(0,earned-paid);return`<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--border)"><div style="font-weight:700;font-size:13px">${r.name}${r.isSelf?' 👑':''}</div><div style="display:flex;gap:8px;align-items:center">${!r.isSelf&&earned>0?`<span style="font-size:11px;color:${owed>0?'var(--gold)':'var(--green)'};font-weight:700">${owed>0?'Owes '+fmt(owed):'✓ Paid'}</span>`:''}${!r.isSelf&&owed>0?`<button class="btn btn-xs btn-green" onclick="openLogRepPmt('${r.id}')">💰 Pay</button>`:''}<button class="btn btn-xs btn-ghost" onclick="openEditRep('${r.id}')">Edit</button></div></div>`;}).join('')}${allRepsOwed().length?`<div style="margin-top:10px;padding:8px;background:var(--redbg);border-radius:6px;font-size:12px;color:var(--red);font-weight:700;text-align:center">Total Outstanding: ${fmt(allRepsOwed().reduce((t,x)=>t+x.owed,0))}</div>`:''}`:`<div style="font-size:12px;color:var(--muted)">Just the owner so far. Tap + Add Rep to build your team.</div>`}
   </div>
   <div class="card bb"><div style="font-size:10px;color:var(--blue);text-transform:uppercase;font-weight:700;margin-bottom:10px">🎤 PASTE CLAUDE UPDATE</div>
   <div style="font-size:12px;color:var(--muted);margin-bottom:10px">Speak to Claude on your phone, copy the command it gives you, paste it here. Updates inventory instantly — no tapping required.</div>
@@ -1647,6 +2431,15 @@ function rSettings(){
     <button class="btn btn-ghost btn-full" onclick="importData()">📥 Import Data</button>
   </div>
   </div>
+  <div class="card bb"><div style="font-size:10px;color:var(--blue);text-transform:uppercase;font-weight:700;margin-bottom:10px">📊 REPORTS & EXPORT</div>
+  <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Download spreadsheets (CSV) or print a PDF for taxes & records.</div>
+  <div class="g2" style="gap:8px;margin-bottom:8px">
+    <button class="btn btn-ghost btn-full" onclick="exportSeasonCSV()">📄 Season CSV</button>
+    <button class="btn btn-ghost btn-full" onclick="exportExpensesCSV()">📄 Expenses CSV</button>
+    <button class="btn btn-ghost btn-full" onclick="exportRepCSV()">📄 Rep Commission CSV</button>
+    <button class="btn btn-gold btn-full" onclick="printFullReport()">🖨️ Full Report (PDF)</button>
+  </div>
+  <div style="font-size:11px;color:var(--muted)">Tip: open any show and tap Export for a single-show CSV or PDF.</div></div>
   <div class="card rb"><div style="font-size:10px;color:var(--red);text-transform:uppercase;font-weight:700;margin-bottom:10px">DANGER ZONE</div>
   <button class="btn btn-red btn-full" onclick="confirmReset()">🗑️ Reset All Data</button></div>
   <div style="text-align:center;margin-top:14px;font-size:11px;color:var(--muted)">Best Solution App · Dot Dynasty LLC<br>Syncs automatically between devices, no login needed</div>
