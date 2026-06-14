@@ -477,7 +477,7 @@ function showEndKey(sh){
   const d=new Date(start+'T12:00:00'); d.setDate(d.getDate()+((sh.numDays||1)-1));
   return d.toISOString().split('T')[0];
 }
-function isMissed(sh){ return sh.status!=='completed' && sh.status!=='active' && showEndKey(sh) < _todayKey(); }
+function isMissed(sh){ if(sh.missedManual===true)return true; return sh.status!=='completed' && sh.status!=='active' && showEndKey(sh) < _todayKey(); }
 function isUpcoming(sh){ return sh.status!=='completed' && !isMissed(sh); }
 function showUnitsSold(sh){ const u={}; SKUS.forEach(s=>u[s.key]=0); (sh.days||[]).forEach(d=>{ if(d.morningCount&&d.eveningCount){ const sold=calcSold(d.morningCount,d.eveningCount); SKUS.forEach(s=>u[s.key]+=(sold[s.key]||0)); } }); return u; }
 function showPmtTotals(sh){ const p={}; PMTS.forEach(x=>p[x.key]=0); (sh.days||[]).forEach(d=>{ if(d.payments) PMTS.forEach(x=>p[x.key]+=(parseFloat(d.payments[x.key])||0)); }); return p; }
@@ -882,7 +882,7 @@ function rHome(){
   </div>
   <button class="btn btn-ghost btn-full" style="margin-bottom:14px" onclick="exportCalICS()">📅 Export Shows to Calendar</button>
   ${activeShows.map(a=>`<button class="btn btn-gold btn-full" style="margin-bottom:14px" onclick="go('show','${a.id}')">🔴 Open Active Show: ${a.name}</button>`).join('')}
-  <div style="text-align:center;font-size:11px;color:var(--muted);padding-bottom:4px">Best Solution App · Dot Dynasty LLC · v6.3</div>
+  <div style="text-align:center;font-size:11px;color:var(--muted);padding-bottom:4px">Best Solution App · Dot Dynasty LLC · v6.4</div>
   `;
 
   pg('home').innerHTML=html;
@@ -1140,15 +1140,27 @@ function saveEditCosts(id){
   sh.notes=v('ec_notes');
   saveS();mClose();toast('Show saved!');renderCur();
 }
+// Blended COGS rate = actual product cost ÷ sell price (real sales mix if any, else
+// catalog average). Replaces the old flat 30% assumption.
+function blendedCogsRate(sh){
+  if(sh){
+    let g=0,c=0;
+    (sh.days||[]).forEach(d=>{ if(d.morningCount&&d.eveningCount){const sold=calcSold(d.morningCount,d.eveningCount);g+=calcRev(sold);c+=calcCOGS(sold);} });
+    if(g>0)return Math.min(0.95,c/g);
+  }
+  let sum=0,n=0;
+  SKUS.forEach(s=>{const price=getP(s.key);if(price>0){sum+=s.cost/price;n++;}});
+  return n?sum/n:0.30;
+}
 function calcBreakEven(sh){
   const gas=showGas(sh);
   const showExp=(sh.showExpenses||[]).reduce((t,e)=>t+(parseFloat(e.amount)||0),0);
   const flatOverhead=(typeof showFlatOverhead==='function')?showFlatOverhead(sh):0; // candy + paper towels
   const fixedCosts=(sh.boothCost||0)+gas+(sh.lodging||0)+showExp+flatOverhead;
   // Need enough SALES that, after product cost (COGS) and rep commission, fixed costs are covered:
-  // BE = fixedCosts / (1 - cogsRate - blendedCommRate)
+  // BE = fixedCosts / (1 - cogsRate - blendedCommRate). cogsRate = ACTUAL product cost.
   const paidRepList=(sh.repIds||[]).map(id=>(S.reps||[]).find(x=>x.id===id)).filter(r=>r&&!r.isSelf&&r.active);
-  const cogsRate=0.30;
+  const cogsRate=blendedCogsRate(sh);
   if(paidRepList.length){
     const blendedCommRate=paidRepList.reduce((t,r)=>{const rt=repCommRates(r);return t+(0.60*rt.cash+0.40*rt.card);},0)/paidRepList.length;
     const variableRate=cogsRate+blendedCommRate;
@@ -1817,9 +1829,10 @@ function rShow(){
   if(!curShow)return;
   const sh=S.shows.find(s=>s.id===curShow);if(!sh){go('shows');return;}
   const t=calcShow(sh);
-  const bdgTxt=sh.status==='active'?'🔴 ACTIVE':sh.status==='completed'?'✅ COMPLETED':'📅 PLANNED';
+  const bdgTxt=isMissed(sh)?'❌ MISSED / DID NOT DO':sh.status==='active'?'🔴 ACTIVE':sh.status==='completed'?'✅ COMPLETED':'📅 PLANNED';
   const dateStr=sh.dates?sh.dates.join(' → '):'';
-  const actBtn=sh.status==='planned'?`<button class="btn btn-gold btn-full" style="margin-bottom:12px" onclick="showPackModal('${sh.id}')">🎒 Start Show / Pack Inventory</button>`:sh.status==='active'?`<button class="btn btn-red btn-full" style="margin-bottom:12px" onclick="showEndModal('${sh.id}')">🏁 End Show &amp; Return Inventory</button>`:'';
+  const missBtn=`<button class="btn btn-ghost btn-full" style="margin-bottom:12px;border-color:var(--redbd);color:var(--red)" onclick="toggleMissShow('${sh.id}')">${sh.missedManual?'↩️ Un-mark — Back to Planned':'⏭️ Mark as Missed / Did Not Do'}</button>`;
+  const actBtn=(sh.status==='planned')?`<button class="btn btn-gold btn-full" style="margin-bottom:12px" onclick="showPackModal('${sh.id}')">🎒 Start Show / Pack Inventory</button>${missBtn}`:sh.status==='active'?`<button class="btn btn-red btn-full" style="margin-bottom:12px" onclick="showEndModal('${sh.id}')">🏁 End Show &amp; Return Inventory</button>`:'';
   const dtabs=sh.days.map((d,i)=>{const ok=d.morningCount&&d.eveningCount&&calcPmt(d.payments)>0;return`<button class="dtab ${i===curDay?'on':''} ${ok&&i!==curDay?'done':''}" onclick="go('show','${sh.id}',${i})">${d.date}${ok?'✓':''}</button>`;}).join('');
 
   pg('show').innerHTML=`
@@ -2016,6 +2029,15 @@ function confirmPack(shId){
   sh.status='active';sh.packedInventory={...pk};sh.days[0].morningCount={...pk};
   mClose();saveS();toast('Show started! Inventory packed.');
 }
+function toggleMissShow(id){
+  const sh=S.shows.find(s=>s.id===id);if(!sh)return;
+  if(sh.missedManual){
+    sh.missedManual=false; saveS(); toast('Back to planned'); go('show',id,0);
+  } else {
+    if(!confirm('Mark "'+sh.name+'" as MISSED / did not do?\n\nIt stays on your list (shown in the Missed group) and is left out of sales totals. You can un-mark it anytime.'))return;
+    sh.missedManual=true; saveS(); toast('Marked as missed'); go('show',id,0);
+  }
+}
 function showCntModal(shId,di,type){
   const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
   const d=sh.days[di];
@@ -2025,10 +2047,15 @@ function showCntModal(shId,di,type){
   mOpen(`<div class="mh"><div class="mt">${type==='morning'?'🌅 Morning Count':'🌙 Evening Count'}</div><button class="mx" onclick="mClose()">×</button></div>
   <div style="font-size:12px;color:var(--muted);margin-bottom:12px">${type==='morning'?'Count everything at your booth right now.':'Count all unsold items at end of day.'}</div>
   ${SKUS.map(s=>`<div class="cr"><div class="cr-i"><div class="cr-n">${s.name}</div>${type==='evening'&&d.morningCount?`<div class="cr-s">Started: ${d.morningCount[s.key]||0}</div>`:''}</div>
-  <div class="cr-c"><button class="crb" onclick="cA('c_${s.key}',-1)">−</button><input class="cri" type="number" id="c_${s.key}" value="${def[s.key]||0}" min="0"><button class="crb" onclick="cA('c_${s.key}',1)">+</button></div></div>`).join('')}
+  <div class="cr-c"><button class="crb" onclick="cA('c_${s.key}',-1)">−</button><input class="cri" type="number" id="c_${s.key}" value="${def[s.key]||0}" min="0" oninput="updCntVal()"><button class="crb" onclick="cA('c_${s.key}',1)">+</button></div></div>`).join('')}
+  <div style="background:var(--card2);border-radius:9px;padding:12px;margin:12px 0;display:flex;justify-content:space-between;align-items:center">
+    <span style="font-weight:900;font-size:12px">EST. RETAIL VALUE</span>
+    <span id="cntVal" style="font-size:20px;font-weight:900;color:var(--gold)">${fmt(SKUS.reduce((t,s)=>t+(def[s.key]||0)*getP(s.key),0))}</span>
+  </div>
   <button class="btn btn-gold btn-full" style="margin-top:12px" onclick="saveCount('${shId}',${di},'${type}')">Save ${type==='morning'?'Morning':'Evening'} Count</button>`);
 }
-function cA(id,d){const e=$$(id);e.value=Math.max(0,parseInt(e.value||0)+d);}
+function cA(id,d){const e=$$(id);e.value=Math.max(0,parseInt(e.value||0)+d);if(id.indexOf('c_')===0)updCntVal();}
+function updCntVal(){const el=$$('cntVal');if(!el)return;let v=0;SKUS.forEach(s=>{const i=$$('c_'+s.key);if(i)v+=(parseInt(i.value||0)||0)*getP(s.key);});el.textContent=fmt(v);}
 function saveCount(shId,di,type){
   const sh=S.shows.find(s=>s.id===shId);if(!sh)return;
   const d=sh.days[di];const c={};SKUS.forEach(s=>c[s.key]=parseInt($$('c_'+s.key).value)||0);
